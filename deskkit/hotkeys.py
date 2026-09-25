@@ -142,7 +142,7 @@ class ModuleHotkeys:
         try:
             mods, vk = parse_hotkey(text)
         except ValueError as e:
-            self._ctx.log.warning("hotkey parse error name=%s: %s", name, e)
+            self._ctx.log.warning("hotkey parse error name=%s: %s", name, type(e).__name__)  # 文は書かない(入力をそのまま含むため)
             self._hub.note_conflict(self._full(name), f"{text}(解釈不能)")
             return False
         try:

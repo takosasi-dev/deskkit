@@ -7,6 +7,7 @@ import getpass
 import hashlib
 import json
 import logging
+import os
 import time
 from collections.abc import Callable
 
@@ -17,6 +18,12 @@ log = logging.getLogger("deskkit.host.ipc")
 
 EXIT_NOT_RUNNING = 10
 EXIT_TIMEOUT = 12
+# H-8: 1回の転送で運べる量。Windows のコマンドラインは 32,767 文字までなので、200 個・合計 32,000 文字のパスは
+# CLI の引数としては上限に近い。IPC 側はその数倍(日本語のパスは UTF-8 で 1 文字 3 バイト)を受けられるようにしておく
+MAX_FORWARD_PATHS = 200
+MAX_FORWARD_CHARS = 32000
+MAX_REQUEST_BYTES = 1 << 20  # 1 行の要求の上限(同じユーザーのプロセスしか繋げないが、際限なく溜めない)
+OPEN_LAUNCH_WAIT_S = 15.0  # H-B: `<module> open ...` で host を起動したとき、転送できるまで待つ最大時間
 
 
 def server_name() -> str:
@@ -25,6 +32,10 @@ def server_name() -> str:
     except Exception:  # noqa: BLE001
         user = "user"
     digest = hashlib.sha256(user.lower().encode("utf-8")).hexdigest()[:12]
+    home = os.environ.get("DESKKIT_HOME")
+    if home:
+        # テスト・自己検査用にデータ置き場を分けた DeskKit は、別のインスタンスとして扱う(本番の常駐に繋がない)
+        return f"DeskKit-{digest}-{hashlib.sha256(home.lower().encode('utf-8')).hexdigest()[:8]}"
     return f"DeskKit-{digest}"
 
 
@@ -69,8 +80,8 @@ class IpcServer(QObject):
         self._server.newConnection.connect(self._on_new)
         self._buffers: dict[QLocalSocket, bytes] = {}
 
-    def listen(self) -> bool:
-        name = server_name()
+    def listen(self, name: str | None = None) -> bool:
+        name = name or server_name()
         if not self._server.listen(name):
             QLocalServer.removeServer(name)
             if not self._server.listen(name):
@@ -96,7 +107,13 @@ class IpcServer(QObject):
     def _on_ready(self, sock: QLocalSocket) -> None:
         try:
             self._buffers[sock] = self._buffers.get(sock, b"") + bytes(sock.readAll().data())
-            if b"\n" not in self._buffers[sock]:
+            end = self._buffers[sock].find(b"\n")
+            if end > MAX_REQUEST_BYTES or (end < 0 and len(self._buffers[sock]) > MAX_REQUEST_BYTES):
+                log.warning("IPC 要求が大きすぎるため切断しました(%d バイト)", len(self._buffers[sock]))
+                self._buffers[sock] = b""
+                sock.abort()
+                return
+            if end < 0:
                 return
             line = self._buffers[sock].split(b"\n", 1)[0]
             try:
@@ -113,14 +130,19 @@ class IpcServer(QObject):
             log.exception("IPC 要求の処理で例外")
 
 
-def forward(args: list[str], timeout_ms: int = 60000) -> tuple[int, str]:
+def forward(args: list[str], timeout_ms: int = 60000, *, name: str | None = None, connect_ms: int = 1500) -> tuple[int, str]:
     """起動中の host へ引数を転送する。host が無ければ (10, ...)、応答が無ければ (12, ...)。"""
     sock = QLocalSocket()
-    sock.connectToServer(server_name())
-    if not sock.waitForConnected(1500):
+    sock.connectToServer(name or server_name())
+    if not sock.waitForConnected(connect_ms):
         return EXIT_NOT_RUNNING, "DeskKit が起動していません"
     sock.write((json.dumps({"args": args}, ensure_ascii=False) + "\n").encode("utf-8"))
     sock.flush()
+    # 大きな要求(H-8: パス 200 個で 100KB 前後)はパイプの送信バッファに入りきらない。イベントループの無い CLI 側では
+    # flush だけでは残りが送られないので、書き終わるまで待つ
+    while sock.bytesToWrite() > 0:
+        if not sock.waitForBytesWritten(timeout_ms):
+            return EXIT_TIMEOUT, "DeskKit へ送り切れませんでした(タイムアウト)"
     buf = b""
     while b"\n" not in buf:
         if not sock.waitForReadyRead(timeout_ms):
@@ -133,3 +155,31 @@ def forward(args: list[str], timeout_ms: int = 60000) -> tuple[int, str]:
         return int(resp.get("code", 1)), str(resp.get("out", ""))
     except (ValueError, AttributeError):
         return 1, "応答を解釈できません"
+
+
+def is_open_command(args: list[str]) -> bool:
+    """`<module> open <paths...>`(SendPrep の「送る」など)か。host が起動していなければ起動してから転送する(H-B)。"""
+    return len(args) >= 2 and not args[0].startswith("-") and args[1] == "open"
+
+
+def forward_or_launch(args: list[str], launch: Callable[[], None], *, wait_s: float = OPEN_LAUNCH_WAIT_S,
+                      interval_s: float = 0.3, forward_fn: Callable[[list[str]], tuple[int, str]] | None = None,
+                      clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> tuple[int, str]:
+    """転送し、host が起動していなければ launch() で起動して、転送できるまで最大 wait_s 秒待つ。
+    起動に失敗した・時間内に繋がらないときは (10, 理由)。host に繋がったあとの結果(モジュールが無効なら 11 など)はそのまま返す。"""
+    fwd = forward_fn or (lambda a: forward(a, connect_ms=500))
+    code, out = fwd(args)
+    if code != EXIT_NOT_RUNNING:
+        return code, out
+    try:
+        launch()
+    except OSError as e:
+        log.error("DeskKit を起動できませんでした: %s", type(e).__name__)
+        return EXIT_NOT_RUNNING, "DeskKit を起動できませんでした"
+    deadline = clock() + wait_s
+    while clock() < deadline:
+        sleep(interval_s)
+        code, out = fwd(args)
+        if code != EXIT_NOT_RUNNING:
+            return code, out
+    return EXIT_NOT_RUNNING, f"DeskKit が {wait_s:.0f} 秒以内に起動しませんでした"

@@ -17,3 +17,7 @@ dist/
 .idea/
 Thumbs.db
 .DS_Store
+
+# 同梱する第三者の配布物(ffmpeg など。build.ps1 の案内に従って手で置く)
+third_party/
+deskkit/_bundled/

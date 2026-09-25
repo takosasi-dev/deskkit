@@ -1,9 +1,24 @@
 [project]
 name = "deskkit"
-version = "0.2.0"
-description = "DeskKit — PC 生活の QOL を上げる常駐ツール群(ModeShift / DropSort / LayoutKeep / ClipShelf)"
+version = "0.3.0"
+description = "DeskKit — PC 生活の QOL を上げる常駐ツール群(ModeShift / DropSort / LayoutKeep / ClipShelf / SendPrep / PcCheckup / TwinSweep)"
 requires-python = ">=3.11"
-dependencies = ["PySide6-Essentials>=6.6"]
+dependencies = [
+    "PySide6-Essentials>=6.6",
+    "Pillow>=12.3",
+    "pi-heif>=1.4",
+    "numpy>=2.5",
+    "psutil>=7.2",
+    "winrt-runtime>=3.2.1",
+    "winrt-Windows.Foundation>=3.2.1",
+    "winrt-Windows.Foundation.Collections>=3.2.1",
+    "winrt-Windows.Globalization>=3.2.1",
+    "winrt-Windows.Graphics.Imaging>=3.2.1",
+    "winrt-Windows.Media.Ocr>=3.2.1",
+    "winrt-Windows.Networking>=3.2.1",
+    "winrt-Windows.Networking.Connectivity>=3.2.1",
+    "winrt-Windows.Storage.Streams>=3.2.1",
+]
 
 [tool.ruff]
 line-length = 130
@@ -14,7 +29,7 @@ select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "BLE"]
 ignore = ["E501", "N802", "N812", "SIM105"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"  # venv とビルドの版。numpy 2.5 の型ファイルは 3.12 以降の構文
 strict = true
 ignore_missing_imports = true
 

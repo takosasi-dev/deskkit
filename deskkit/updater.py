@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from deskkit import __version__
+from deskkit import __version__, paths
 
 DEFAULT_REPO = "takosasi-dev/deskkit"
 ASSET_EXE = "DeskKit.exe"
@@ -184,7 +184,8 @@ def verify_runs(exe: Path, expected_version: str, timeout: float = 120) -> None:
     os.close(fd)
     try:
         flags = 0x08000000  # CREATE_NO_WINDOW
-        subprocess.run([str(exe), "--version-file", out], timeout=timeout, check=True, creationflags=flags)
+        subprocess.run([str(exe), "--version-file", out], timeout=timeout, check=True, creationflags=flags,
+                       env=paths.child_env())
         got = Path(out).read_text(encoding="utf-8").strip()
     except (subprocess.SubprocessError, OSError) as e:
         raise UpdateError("新しい版を試しに起動できませんでした") from e
@@ -299,7 +300,8 @@ def swap_back() -> Path:
 def relaunch(exe: Path, extra: list[str]) -> None:
     flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     try:
-        subprocess.Popen([str(exe), "--post-update", str(os.getpid()), *extra], creationflags=flags, close_fds=True)
+        subprocess.Popen([str(exe), "--post-update", str(os.getpid()), *extra], creationflags=flags, close_fds=True,
+                         env=paths.child_env())
     except OSError as e:
         raise UpdateError(f"新しい DeskKit を起動できませんでした。{exe.name} を手で起動してください") from e
 

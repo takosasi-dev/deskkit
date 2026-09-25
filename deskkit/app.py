@@ -45,8 +45,10 @@ def _excepthook(tp: type[BaseException], val: BaseException, tb: Any) -> None:
 
 HELP = f"""{APP_NAME} {__version__}
   DeskKit                       常駐を開始(起動中なら画面を開く)
-  DeskKit --selftest [対象]     自己検査(host / all / modeshift / dropsort / layoutkeep / clipshelf)
+  DeskKit --selftest [対象]     自己検査(host / all / modeshift / dropsort / layoutkeep / clipshelf / sendprep / pccheckup / twinsweep)
   DeskKit <モジュール> <引数>   起動中の DeskKit へ転送(例: DeskKit mode --list, DeskKit dropsort status)
+  DeskKit <モジュール> open <ファイル...>
+                                ファイルを渡す(例: DeskKit sendprep open a.jpg)。起動していなければ起動してから渡す
   DeskKit --quit                常駐を終了
 """
 
@@ -98,13 +100,17 @@ def main(argv: list[str]) -> int:
     logging_setup.setup_faulthandler(paths.log_dir())
     from deskkit import ipc
 
-    is_command = bool(argv) and argv[0] not in ("--autostart", "--show")
+    is_command = bool(argv) and argv[0] not in ("--autostart", "--show", LAUNCHED_FLAG)
     if is_command:
         from PySide6.QtCore import QCoreApplication
 
         _app = QCoreApplication(sys.argv[:1])
         _attach_console()
-        code, out = ipc.forward(argv)
+        if ipc.is_open_command(argv):
+            # H-B: 「送る」などから渡されたファイルは、DeskKit が起動していなければ起動してから渡す(最大 15 秒待つ)
+            code, out = ipc.forward_or_launch(argv, launch_host_detached)
+        else:
+            code, out = ipc.forward(argv)
         if out:
             print(out)
         return code
@@ -121,6 +127,23 @@ def main(argv: list[str]) -> int:
 
 
 POST_UPDATE_MUTEX_WAIT_S = 180.0
+# H-B: `<module> open ...` が host を起動するときの引数。画面・はじめてガイド・「起動しました」の通知を出さずに常駐を始める
+# (画面はモジュールの handle_cli が ctx.show_page() で開く)
+LAUNCHED_FLAG = "--launched-for-open"
+
+
+def host_launch_spec() -> tuple[list[str], str | None]:
+    """常駐の DeskKit を別プロセスで起動するコマンドと cwd。exe なら自分の exe、ソース実行なら pythonw -m deskkit(cwd はリポジトリ直下)。"""
+    cmd = paths.launch_command() + [LAUNCHED_FLAG]
+    return cmd, None if paths.is_frozen() else str(paths.source_root())
+
+
+def launch_host_detached() -> None:
+    import subprocess
+
+    cmd, cwd = host_launch_spec()
+    subprocess.Popen(cmd, cwd=cwd, env=paths.child_env(), close_fds=True,
+                     creationflags=0x00000008 | 0x00000200)  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 
 
 def _forward_to_running(argv: list[str]) -> int:
@@ -130,7 +153,8 @@ def _forward_to_running(argv: list[str]) -> int:
     from deskkit import ipc
 
     _app = QCoreApplication(sys.argv[:1])
-    code, _out = ipc.forward(["--show"] if not argv or argv[0] != "--autostart" else ["--autostart"], 5000)
+    quiet = bool(argv) and argv[0] in ("--autostart", LAUNCHED_FLAG)  # 画面を開かない起動(何もしない要求を送る)
+    code, _out = ipc.forward(["--autostart"] if quiet else ["--show"], 5000)
     return 0 if code in (0, ipc.EXIT_NOT_RUNNING) else code
 
 
@@ -172,12 +196,13 @@ def _run_resident(argv: list[str], dpi: str, notice: str | None) -> int:
     host = Host(app, dpi)
     created = host.start()
     autostarted = bool(argv) and argv[0] == "--autostart"
+    for_open = bool(argv) and argv[0] == LAUNCHED_FLAG  # H-B: ファイルを渡すために起動された(画面はモジュールが開く)
     if notice:
         host.notify("host", notice, "", host.show_window, level="ok")
         after_update_housekeeping()
-    if created or (not autostarted and host.settings.host().get("show_window_on_start", True)):
+    if created or (not autostarted and not for_open and host.settings.host().get("show_window_on_start", True)):
         host.show_window()
-    if not host.settings.host().get("onboarded", False) and not autostarted:
+    if not host.settings.host().get("onboarded", False) and not autostarted and not for_open:
         from PySide6.QtCore import QTimer
 
         QTimer.singleShot(500, host.show_onboarding)

@@ -152,6 +152,27 @@ def run_host() -> int:
     _check(results, "H4 診断レポートにユーザーのフォルダを含めない", "診断レポート" in rep and home_s not in rep.lower()
            and tmp.lower() not in rep.lower())
 
+    # ---- v0.3(docs/INTERFACES_v0.3.md)
+    from deskkit import ipc, licenses
+    from deskkit.ui import theme as _theme
+
+    lic = licenses.read_text()
+    _check(results, "H-5 THIRD_PARTY_LICENSES.txt を読める(ffmpeg のソースの入手先を含む)",
+           licenses.licenses_path() is not None and "https://ffmpeg.org/releases/" in lic and len(licenses.summary(lic)) >= 8)
+    frozen = bool(getattr(sys, "frozen", False))
+    bundled = Path(getattr(sys, "_MEIPASS", "")) / "deskkit" / "_bundled" if frozen else Path(__file__).with_name("_bundled")
+    if frozen or bundled.exists():  # ソース実行では tools/make_ffmpeg_bundle.py を実行したときだけ確かめる
+        sha_file = bundled / "ffmpeg.sha256"
+        sha = sha_file.read_text(encoding="ascii").strip() if sha_file.is_file() else ""
+        _check(results, "H-7 ffmpeg の同梱物(ffmpeg.zip と ffmpeg.sha256)がある",
+               (bundled / "ffmpeg.zip").is_file() and len(sha) == 64, str(bundled))
+    missing = [n for n in MODULE_NAMES if n not in _theme._LIGHT_MODULE_ACCENTS or n not in _theme._CHART_DARK]
+    _check(results, "H-C 全モジュールにライト用の色とグラフの色がある", not missing, str(missing))
+    _check(results, "H-B `<module> open` を起動の経路として判定する",
+           ipc.is_open_command(["sendprep", "open", "a"]) and not ipc.is_open_command(["sendprep", "status"]))
+    code, _ = host.handle_cli(["sendprep", "open", "x.jpg"])  # 無効なモジュールへの open は 11(通知は出すが落ちない)
+    _check(results, "H-B 無効なモジュールへの open は終了コード 11", code == 11, str(code))
+
     from deskkit.hotkeys import format_hotkey, parse_hotkey
 
     _check(results, "ホットキー表記の往復", format_hotkey(*parse_hotkey("ctrl+shift+space")) == "Ctrl+Shift+Space")

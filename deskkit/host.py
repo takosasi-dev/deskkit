@@ -402,6 +402,16 @@ class Host:
         name = CLI_ALIASES.get(args[0], args[0])
         mod = self.loader.module(name)
         if mod is None:
+            if len(args) >= 2 and args[1] == "open" and name in catalog.MODULE_NAMES:
+                # 「送る」から渡されたのに受け取れない: 画面から起動していないので、黙って捨てずに知らせる(H-B)
+                title = catalog.info(name).title
+                target = name
+
+                def open_page() -> None:
+                    self.show_window(target)
+
+                self.notify("host", f"{title} が無効なので、ファイルを受け取れませんでした",
+                            f"Control Center で {title} を有効にしてから、もう一度送ってください", open_page, level="warn")
             return 11, f"{name} は無効または停止中です"
         ctx = self.loader.slots[name].ctx
         assert ctx is not None
@@ -415,13 +425,11 @@ class Host:
     def restart(self) -> None:
         """同じ DeskKit を起動し直す(テーマ変更の反映など)。新しい方はこのプロセスの終了を待ってから始まる。"""
         import subprocess
-        from pathlib import Path
-
-        import deskkit
 
         cmd = paths.launch_command() + ["--post-update", str(os.getpid())]
-        cwd = None if paths.is_frozen() else str(Path(deskkit.__file__).resolve().parents[1])
-        subprocess.Popen(cmd, cwd=cwd, creationflags=0x00000008 | 0x00000200, close_fds=True)  # DETACHED | NEW_GROUP
+        cwd = None if paths.is_frozen() else str(paths.source_root())
+        subprocess.Popen(cmd, cwd=cwd, creationflags=0x00000008 | 0x00000200, close_fds=True,  # DETACHED | NEW_GROUP
+                         env=paths.child_env())
         QTimer.singleShot(150, self.quit)
 
     @property

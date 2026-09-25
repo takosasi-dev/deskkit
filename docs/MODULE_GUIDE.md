@@ -18,6 +18,30 @@
 - モジュールごとの仕様書からの変更点・既定値・理由: `docs/v0.2/modeshift.md` / `dropsort.md` / `layoutkeep.md` / `clipshelf.md`
 - 利用者の判断: ModeShift の操作記録(ops.jsonl)に残す URL はドメインだけ(ModeShift 仕様書 INV-11 と共通 C-12 の食い違いの解消)。
 
+## 0.2 v0.3.0 の変更点
+
+- 担当間の取り決め: `docs/INTERFACES_v0.3.md`。共通仕様: `DeskKit_v0.3_追加モジュール共通_仕様書.md`(V-* / H-* / VINV-* / NFR-*)。
+- 追加モジュール: SendPrep(共有前クリーナー)・PcCheckup(PC 不調の診断)・TwinSweep(似た写真の整理)。「困ったときに開いて1回で片づける」道具で、
+  利用者が操作したときだけ動く(自動で動くのは PcCheckup の「空き容量の見張り」だけ、既定オフ)。仕様書からの変更点・実測は `docs/v0.3/<モジュール>.md`。
+- **ごみ箱へ送る処理は `deskkit.fileops.recycle` だけ**を使う(V-6・VINV-2)。`os.remove` / `unlink` / `shutil.rmtree` / `send2trash` で利用者のファイルを消さない。
+  `recycle(paths, parent_hwnd=None)` → `RecycleResult`(`sent` / `skipped` / `sent_count` / `count(reason)`)。理由コードは
+  `skipped_no_recycle_bin`(固定ディスク以外。ファイルは残る)/ `not_found` / `in_use` / `aborted`(恒久削除の確認で「いいえ」)/ `failed`。
+  1件ずつ `SHFileOperationW` を呼ぶので遅い。**GUI スレッドの外から呼び**、結果は `ctx.call_soon` で画面へ返す。テストは `api=` に `RecycleApi` の偽物を渡す。
+- 追加ライブラリ: Pillow 12.3 / pi-heif 1.4 / numpy 2.5 / psutil 7.2 / winrt 3.2.1(`winrt.windows.media.ocr` など)。**`create()` と import 時には読まず、
+  最初に使う関数の中で import する**(NFR-5)。exe には deskkit.spec が名前で入れている(新しい winrt の名前空間を使うときは spec の `WINRT_NAMESPACES` に足すよう本体担当へ依頼する)。
+- ffmpeg(SendPrep だけ): 同梱物は `deskkit/_bundled/ffmpeg.zip`(LZMA、中身は `ffmpeg.exe` と `LICENSE.txt`)と `ffmpeg.sha256`(ffmpeg.exe の SHA-256、16進小文字 + 改行)。
+  exe では `Path(sys._MEIPASS) / "deskkit" / "_bundled"`、ソース実行では `Path(deskkit.__file__).parent / "_bundled"`。開発時は `tools/make_ffmpeg_bundle.py` で作る
+  (`third_party/ffmpeg/` に BtbN の `ffmpeg-n8.1-latest-win64-lgpl-8.1.zip` と `checksums.sha256` が要る。どちらも git 管理外)。
+- CLI `DeskKit <module> open <paths...>`: host が起動していなければ本体が起動してから転送する(最大 15 秒)。モジュールの `handle_cli(["open", *paths])` は
+  パスを積んで `ctx.show_page()` を呼び、`(0, "queued N")` を返す。1回で運べるのは 200 個・合計 32,000 文字まで(本体の IPC は 1MB まで受ける)。
+  この経路で起動された host は画面を自分では開かない(モジュールの `show_page()` が開く)。受け取るモジュールが無効なら、本体が警告の通知を出して 11 を返す。
+- ログ・操作記録・`diagnostics()` にファイル名・フォルダのパス・SSID・文字認識で読んだ文字列を書かない(V-7・VINV-4。v0.2 の「本文・URL」より広い)。
+  画面には出してよい(V-8)。
+- テーマ: 3モジュールのライト用アクセント色とグラフの色は `deskkit/ui/theme.py`(7 色で dataviz の検証を両テーマで PASS)。モジュールは従来どおり
+  `catalog.info(name).accent` と `theme.chart_color(name)` を実行時に読むだけ。
+- 本体の設定画面に「ライセンス」(同梱の `THIRD_PARTY_LICENSES.txt` を表示。作り直しは `tools/make_third_party_licenses.py`)。ライブラリを足したら本体担当へ知らせる。
+- テストの `DESKKIT_HOME` を一時フォルダに向けた host は、IPC の名前も分かれる(本番の常駐に繋がない)。
+
 ## 1. パッケージ構成
 
 ```
@@ -32,7 +56,8 @@ tests/modules/<name>/   pytest(偽 Win32 で。実機依存は @pytest.mark.win3
 
 - 各ソースファイル先頭に責務を3行以内の日本語コメントで書く。
 - 他モジュールを import しない(C-1)。host の内部(`deskkit.host`, `deskkit.loader`, `deskkit.win32`)も import しない。
-  使ってよい host 側: `deskkit.context`(型)、`deskkit.ui.*`(GUI 部品)、`deskkit.hotkeys`(parse_hotkey/format_hotkey)、`deskkit.catalog`(自分のアクセント色)、`deskkit.foreground.ForegroundInfo`(型)。
+  使ってよい host 側: `deskkit.context`(型)、`deskkit.ui.*`(GUI 部品)、`deskkit.hotkeys`(parse_hotkey/format_hotkey)、`deskkit.catalog`(自分のアクセント色)、`deskkit.foreground.ForegroundInfo`(型)、`deskkit.usage`(§7)、
+  (v0.3)`deskkit.fileops`(`recycle` / `RecycleResult` / `RecycleApi`。ファイルをごみ箱へ送るのはこれだけ。§0.2)。
 - Win32 は各モジュールの `_win32.py` に ctypes で書き、`Protocol` の背後に置いてテストで偽物に差し替える。argtypes/restype を必ず設定する(64bit で HANDLE が切れるのを防ぐ)。
 
 ## 2. Module の形
@@ -72,7 +97,7 @@ class Module:
 | `ctx.hidden_hwnd()` | host の隠しウィンドウ(クリップボードの OpenClipboard の所有者などに使う) |
 | `ctx.foreground() -> ForegroundInfo` | `hwnd pid exe is_game is_fullscreen is_elevated` と `unsafe_for_input()`、`reason()`(game/fullscreen/elevated/...)。全画面判定は host が矩形一致で実装済み(False/True が返る) |
 | `ctx.emit(event, payload)` / `ctx.on(event, handler)` | 登録済みイベント: `layout.apply` / `layout.applied` / `modeshift.switched` /(v0.2)`modeshift.reverted` / `host.snooze_changed`。payload は `docs/INTERFACES_v0.2.md` §2 |
-| `ctx.safe(fn, label) -> wrapped` | 例外を捕まえてログし、連続 N 回でモジュールを停止中にするラッパー。**自分のウィジェットのシグナル→モジュール処理の接続や、Qt 仮想メソッド(keyPressEvent 等)の中身は必ずこれか try/except で包む** |
+| `ctx.safe(fn, label) -> wrapped` | 例外を捕まえてログし、連続 N 回でモジュールを停止中にするラッパー。**自分のウィジェットのシグナル→モジュール処理の接続や、Qt 仮想メソッド(keyPressEvent 等)の中身は必ずこれか try/except で包む**。(v0.3)ログには例外の型名と DeskKit のソースのファイル名・行番号だけを書き、例外の文(`str(e)`。OSError のパスなど)は書かない。`log.exception(...)` も本体のログ書式で同じ扱いになる(`deskkit.logging_setup.describe_exception`)。ただし自分で `log.error("...%s", e)` のように文を埋め込むと書かれてしまうので、しないこと |
 | `ctx.call_soon(fn)` | 任意スレッド→メインスレッドで fn を実行(監視スレッドから使う) |
 | `ctx.start_timer(ms, cb, single_shot=False) -> QTimer` | safe 済みタイマー(停止時に host が止める) |
 | `ctx.dpi_awareness()` | `"per_monitor_aware_v2"` 等 |

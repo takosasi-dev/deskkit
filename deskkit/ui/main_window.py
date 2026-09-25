@@ -377,7 +377,7 @@ class HomePage(ScrollPage):
     def __init__(self, host: Host, open_page: Any) -> None:
         super().__init__()
         self._host = host
-        self.hero = Hero(greeting(), "DeskKit は1つの常駐プロセスで4つの QOL ツールをまとめて動かします。", G.SPARKLE, T.ACCENT)
+        self.hero = Hero(greeting(), f"DeskKit は1つの常駐プロセスで{len(catalog.MODULES)}つの QOL ツールをまとめて動かします。", G.SPARKLE, T.ACCENT)
         self.sn_pill = StatusPill("", "warn")
         self.fg_pill = StatusPill("前面ウィンドウを確認中…", "info")
         self.as_pill = StatusPill("", "off")
@@ -842,14 +842,27 @@ class SettingsPage(ScrollPage):
                           button("コピー", "secondary", G.COPY, host.copy_diagnostics), G.COPY))
         self.add(dg)
 
+        # ---- ライセンス(H-5)
+        lic = Card("ライセンス", "DeskKit.exe に含まれているほかのソフトウェア(Qt・Pillow・ffmpeg など)と、そのライセンスです。"
+                   "ffmpeg などのソースの入手先も載せています。", G.LIST, T.ACCENT)
+        lic.add(SettingRow("サードパーティのライセンス", "THIRD_PARTY_LICENSES.txt を表示します。",
+                           button("開く", "secondary", G.OPEN, self._show_licenses), G.LIST))
+        self.add(lic)
+
         about = Card(f"{APP_NAME} {__version__}", "この道具がしないこと", G.SHIELD, T.SUCCESS)
         for s in ("通信するのはアップデートの確認とダウンロード(GitHub)だけです。上の設定でオフにできます。",
                   "キーボードやマウスの入力を横取りしません(ホットキーは Windows の RegisterHotKey のみ)。",
                   "管理者権限を求めません。ゲームのメモリや入力には触れません。",
-                  "クリップボードの本文・ファイルの中身・URL をログに書きません。"):
+                  "クリップボードの本文・ファイルの中身や名前・フォルダの場所・URL をログに書きません。",
+                  "ファイルを消すときは、確認してからごみ箱へ送ります(元に戻せます)。元の写真や動画は書き換えません。"):
             about.add(label("✓  " + s, "Dim", wrap=True))
         self.add(about)
         self.finish()
+
+    def _show_licenses(self) -> None:
+        from deskkit.ui.license_dialog import show_licenses
+
+        show_licenses(self.window())
 
     def _save_adv(self) -> None:
         self._save_host({"handler_error_limit": int(self.lim.value()), "log_retention_days": int(self.ret.value()),

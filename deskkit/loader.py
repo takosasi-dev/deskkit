@@ -33,8 +33,10 @@ def module_package(name: str) -> str:
 
 
 def _short(e: BaseException) -> str:
-    first = (str(e).splitlines() or [""])[0]
-    return f"{type(e).__name__}: {first}"[:160]
+    """停止の理由(画面・ログ・診断レポートに出る)。例外の文はパスを含みうるので、型名と DeskKit のソースの位置だけ。"""
+    from deskkit.logging_setup import describe_exception
+
+    return describe_exception(e)[:200]
 
 
 class Loader(QObject):

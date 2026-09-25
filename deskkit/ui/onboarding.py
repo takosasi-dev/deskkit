@@ -92,7 +92,7 @@ class Onboarding(StyledDialog):
 
         logo = QLabel()
         logo.setPixmap(icons.render(192).scaled(96, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        p1, _ = _page(logo, "PC 生活を、少しずつ快適に", "DeskKit は4つの小さな道具を、1つの常駐アプリ・1つのトレイアイコンにまとめたものです。"
+        p1, _ = _page(logo, "PC 生活を、少しずつ快適に", f"DeskKit は{len(catalog.MODULES)}つの小さな道具を、1つの常駐アプリ・1つのトレイアイコンにまとめたものです。"
                       "使いたいものだけをオンにして使います。")
         self.stack.addWidget(p1)
 
@@ -101,12 +101,13 @@ class Onboarding(StyledDialog):
         grid.setSpacing(10)
         for i, m in enumerate(catalog.MODULES):
             grid.addWidget(_point(m.glyph, m.accent, m.title, m.tagline), i // 2, i % 2)
-        p2, l2 = _page(_big_glyph(G.APP, T.ACCENT), "4つの道具", "どれも独立していて、1つが止まっても他は動き続けます。")
+        p2, l2 = _page(_big_glyph(G.APP, T.ACCENT), f"{len(catalog.MODULES)}つの道具", "どれも独立していて、1つが止まっても他は動き続けます。")
         l2.addWidget(grid_w)
         self.stack.addWidget(p2)
 
         p3, l3 = _page(_big_glyph(G.SHIELD, T.SUCCESS), "安心して試せる仕組み", "")
-        for g, t, d in ((G.EYE, "最初は試運転", "ファイルやウィンドウを動かす前に「何をする予定か」だけを表示します。確認してから本番に切り替えます。"),
+        for g, t, d in ((G.EYE, "最初は試運転", "ファイルやウィンドウを動かす前に「何をする予定か」だけを表示します。確認してから本番に切り替えます。"
+                         "写真の整理や PC の診断は、ボタンを押したときだけ動きます。"),
                         (G.UNDO, "元に戻せる", "整理したファイル・戻したウィンドウ配置・変えた音量や電源プランは元に戻せます。"),
                         (G.GAME, "ゲーム中は控える", "ゲームや全画面の動画が前面にある間は、画面に割り込む操作をしません。"),
                         (G.LOCK, "中身を外に出さない", "クリップボードの履歴は暗号化して保存し、ログにも本文を書きません。通信は更新の確認だけです。")):

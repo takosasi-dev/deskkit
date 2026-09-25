@@ -48,6 +48,20 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def child_env() -> dict[str, str]:
+    """DeskKit.exe(自分や新しい版)を別プロセスとして起動するときの環境変数。
+    onefile の exe から自分の exe を起動すると、既定では親の展開先フォルダを使い回す「子」として扱われ、
+    親が終わると展開先が消えて動かなくなる。PYINSTALLER_RESET_ENVIRONMENT=1 で独立した起動にする(ソース実行では無害)。"""
+    env = dict(os.environ)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
+def source_root() -> Path:
+    """ソース実行のときのリポジトリ直下(deskkit パッケージの1つ上。pip install していないので cwd に使う)。"""
+    return Path(__file__).resolve().parents[1]
+
+
 def launch_command() -> list[str]:
     """自動起動や再起動に使う、今の DeskKit を起動するコマンド。"""
     if is_frozen():
