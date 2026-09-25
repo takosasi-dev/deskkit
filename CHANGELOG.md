@@ -15,7 +15,7 @@
 - 本体: 3モジュールの色(ライト用のアクセント色とグラフの色。7 色で明度・色覚差・コントラストを両テーマで検証)。
 
 ### Changed
-- DeskKit.exe が大きくなる(v0.2.0 の約 40MB から、100MB 前後の見込み。実測は docs/v0.3/measurements.md)。
+- DeskKit.exe が大きくなる(v0.2.0 の約 40MB から約 98MB。起動の時間は同じ 2.0 秒。実測は docs/v0.3/measurements.md)。
   写真の読み込み(Pillow・pi-heif)・計算(NumPy)・PC の情報(psutil)・Windows の文字認識(PyWinRT)の各ライブラリと、
   動画の処理に使う ffmpeg(LGPL 版。LZMA で圧縮した zip のまま入れ、初めて動画を扱うときだけ展開する)を同梱するため。
   ライブラリは使うときに初めて読み込むので、起動の速さと常駐のメモリはほとんど変わらない。
