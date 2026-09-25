@@ -29,6 +29,14 @@ class MasterState:
 
 
 @dataclass(frozen=True)
+class ThemeState:
+    """アプリ・Windows(タスクバー等)のテーマ。"dark" / "light"。値が無い・読めないものは None。"""
+
+    apps: str | None
+    system: str | None
+
+
+@dataclass(frozen=True)
 class SessionInfo:
     session_id: str  # IAudioSessionControl2::GetSessionInstanceIdentifier
     pid: int
@@ -50,6 +58,17 @@ class CloseRequest:
     last_error: int = 0
 
 
+class ForceTarget(Protocol):
+    """FR-14 の強制終了の候補。確認ダイアログを出す前に開いたプロセスハンドル(PID ではなくハンドルで終了させる)。
+    開いている間はプロセスオブジェクトが残るので、対象が先に終了しても PID が別のプロセスに再利用されることはない。"""
+
+    @property
+    def pid(self) -> int: ...
+    def alive(self) -> bool: ...
+    def terminate_confirmed(self) -> tuple[bool, str]: ...   # 利用者が確認ダイアログで承認した後にだけ呼ぶ
+    def close(self) -> None: ...
+
+
 class ProcessApi(Protocol):
     def list_processes(self) -> list[ProcInfo]: ...
     def exe_path(self, pid: int) -> str | None: ...
@@ -57,7 +76,7 @@ class ProcessApi(Protocol):
     def is_alive(self, pid: int) -> bool: ...
     def post_close(self, pids: set[int]) -> CloseRequest: ...
     def wait_exit(self, pids: set[int], timeout_s: float, abort: threading.Event) -> set[int]: ...
-    def force_terminate_confirmed(self, pid: int) -> tuple[bool, str]: ...
+    def open_for_force(self, pid: int, exe: str) -> ForceTarget | None: ...   # 開けない/exe が違えば None
 
 
 class Launcher(Protocol):
@@ -68,13 +87,24 @@ class PowerApi(Protocol):
     def list_schemes(self) -> list[PowerScheme]: ...
     def get_active(self) -> str | None: ...           # 取れない/書式が想定外なら None
     def set_active(self, guid: str) -> tuple[bool, str]: ...
+    def ac_online(self) -> bool | None: ...           # AC 電源なら True / バッテリーなら False / 不明なら None
 
 
 class AudioApi(Protocol):
     def get_master(self) -> MasterState | None: ...
     def set_master(self, level: float | None, mute: bool | None) -> MasterState | None: ...  # 読み戻し値
+    # 既定の録音デバイス(マイク)。値の形は MasterState と同じ(device_id は録音デバイスの ID)
+    def get_capture(self) -> MasterState | None: ...
+    def set_capture(self, level: float | None, mute: bool | None) -> MasterState | None: ...  # 読み戻し値
     def list_sessions(self) -> list[SessionInfo]: ...
     def set_sessions(self, levels: dict[str, float]) -> dict[str, float | None]: ...        # 読み戻し値
+
+
+class ThemeApi(Protocol):
+    def get(self) -> ThemeState: ...
+    # None の項目は変えない。書いたあと WM_SETTINGCHANGE("ImmersiveColorSet")を送り、読み戻した値を返す。
+    # 戻り値の文字列は結果の注記(通知できなかったウィンドウがある等)
+    def set(self, apps: str | None, system: str | None) -> tuple[ThemeState | None, str]: ...
 
 
 class Opener(Protocol):
@@ -89,6 +119,7 @@ class Backends:
     power: PowerApi
     audio: AudioApi
     opener: Opener
+    theme: ThemeApi
 
 
 def real_backends() -> Backends:
@@ -97,5 +128,6 @@ def real_backends() -> Backends:
     from deskkit.modules.modeshift.actions.launch import PopenLauncher
     from deskkit.modules.modeshift.actions.open import ShellOpener
     from deskkit.modules.modeshift.actions.power import PowercfgPower
+    from deskkit.modules.modeshift.actions.theme import RegistryTheme
 
-    return Backends(Win32Processes(), PopenLauncher(), PowercfgPower(), CoreAudio(), ShellOpener())
+    return Backends(Win32Processes(), PopenLauncher(), PowercfgPower(), CoreAudio(), ShellOpener(), RegistryTheme())

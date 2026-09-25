@@ -1,6 +1,6 @@
 # Control Center の ModeShift 画面: ヒーロー(現在のモード・最終切替・元に戻す)、数値タイル、モードタイル
 # (現在のモードは光彩が脈打つ)、モード編集、動作設定(プレビュー方針・強制終了の許可・undo ホットキー)、
-# 自動切替のルール編集、履歴(ops.jsonl の新しい順)。設定の変更はその場で保存して反映する。
+# 自動切替のルール編集(exe の起動・電源の切り替わり)、履歴(ops.jsonl の新しい順)。設定の変更はその場で保存して反映する。
 from __future__ import annotations
 
 import logging
@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from deskkit.catalog import info as module_info
-from deskkit.modules.modeshift.config import POLL_MAX_S
+from deskkit.modules.modeshift.config import POLL_MAX_S, TRIGGER_AC, TRIGGER_BATTERY, TRIGGER_EXE
 from deskkit.modules.modeshift.editor import ModeEditor, ProcessPicker
 from deskkit.modules.modeshift.model import TYPE_LABELS
 from deskkit.modules.modeshift.preview import result_color
@@ -36,6 +36,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("deskkit.modeshift")
 SOURCE_LABELS = {"tray": "トレイ", "hotkey": "ホットキー", "cli": "CLI", "auto": "自動", "gui": "画面", "undo": "元に戻す"}
+# 自動切替のきっかけ(表示名)と、そのきっかけが終わったときの on_exit の説明
+TRIGGER_LABELS = {TRIGGER_EXE: "exe が起動した", TRIGGER_BATTERY: "バッテリー駆動になった", TRIGGER_AC: "AC 電源につないだ"}
+ON_EXIT_UNDO_LABELS = {TRIGGER_EXE: "exe が終了したら元に戻す", TRIGGER_BATTERY: "AC に戻ったら元に戻す",
+                       TRIGGER_AC: "バッテリーに戻ったら元に戻す"}
 RESULT_LABELS = {"ok": "成功", "skipped": "スキップ", "failed": "失敗", "still_running": "終了せず", "aborted": "中断",
                  "planned": "予定"}
 
@@ -182,14 +186,16 @@ class ModeShiftPage(W.ScrollPage):
 
     # ---------------------------------------------------------------- 自動切替
     def _build_auto(self) -> W.Card:
-        c = W.Card("自動切替(任意)", "指定した exe が起動したらモードを適用し、終了したら元に戻します。プロセス一覧(exe 名だけ)を一定間隔で見ます。",
+        c = W.Card("自動切替(任意)", "指定した exe が起動したとき、または電源が AC ⇄ バッテリーに切り替わったときにモードを適用し、"
+                   "終わったら元に戻します。exe はプロセス一覧(exe 名だけ)を一定間隔で見ます。電源は Windows からの知らせで動きます。",
                    G.LIGHTNING, self.info.accent)
         cfg = self.svc.config if self.svc else None
         self.auto_pill = W.StatusPill("", "off")
         c.add_header_widget(self.auto_pill)
         self.tg_auto = W.ToggleSwitch(bool(cfg and cfg.auto_enabled), self.info.accent)
         self.tg_auto.toggled.connect(guard(lambda on: self._save_auto(enabled=bool(on))))
-        c.add(W.SettingRow("自動切替を使う", "未確認のモードは自動では実行せず、通知だけします。", self.tg_auto, G.LIGHTNING))
+        c.add(W.SettingRow("自動切替を使う", "未確認のモードは自動では実行せず、通知だけします。DeskKit の一時停止中は自動で切り替えません。",
+                           self.tg_auto, G.LIGHTNING))
         self.sp_poll = QDoubleSpinBox()
         self.sp_poll.setRange(0, POLL_MAX_S)
         self.sp_poll.setDecimals(1)
@@ -199,10 +205,12 @@ class ModeShiftPage(W.ScrollPage):
         self.sp_poll.setValue(float(cfg.poll_interval_s or 0) if cfg else 0)
         self.sp_poll.setMinimumWidth(120)
         self.sp_poll.editingFinished.connect(guard(lambda: self._save_auto(poll=self.sp_poll.value())))
-        c.add(W.SettingRow("確認する間隔", "0.5 秒以上。実測で決めてください(短いほど早く気づき、CPU を少し多く使います)。未設定のままでは動きません。",
-                           self.sp_poll, G.CLOCK))
-        self.rules = QTableWidget(0, 3)
-        self.rules.setHorizontalHeaderLabels(["起動を見張る exe", "適用するモード", "その exe が終了したら"])
+        c.add(W.SettingRow("確認する間隔", "exe のきっかけ用。0.5 秒以上。実測で決めてください(短いほど早く気づき、CPU を少し多く使います)。"
+                           "未設定のままでは exe のきっかけは動きません(電源のきっかけには不要)。", self.sp_poll, G.CLOCK))
+        self.power_now = W.label("", "Mute")
+        c.add(self.power_now)
+        self.rules = QTableWidget(0, 4)
+        self.rules.setHorizontalHeaderLabels(["きっかけ", "起動を見張る exe", "適用するモード", "きっかけが終わったら"])
         self.rules.verticalHeader().setVisible(False)
         self.rules.setMinimumHeight(150)
         self.rules.verticalHeader().setDefaultSectionSize(44)
@@ -210,6 +218,7 @@ class ModeShiftPage(W.ScrollPage):
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         c.add(self.rules)
         self.rules_err = W.label("", wrap=True)
         self.rules_err.setStyleSheet(f"color: {T.DANGER};")
@@ -217,6 +226,7 @@ class ModeShiftPage(W.ScrollPage):
         bar = QHBoxLayout()
         bar.addWidget(W.button("ルールを追加", "secondary", G.ADD, on_click=guard(self._add_rule)))
         bar.addWidget(W.button("動作中から追加…", "ghost", G.APP, on_click=guard(self._add_rule_from_proc)))
+        bar.addWidget(W.button("電源のルールを追加", "ghost", G.POWER, on_click=guard(self._add_power_rule)))
         bar.addWidget(W.button("選んだ行を削除", "ghost", G.DELETE, on_click=guard(self._del_rule)))
         bar.addStretch(1)
         bar.addWidget(W.button("ルールを保存", "primary", G.SAVE, on_click=guard(self._save_rules)))
@@ -224,12 +234,19 @@ class ModeShiftPage(W.ScrollPage):
         self._load_rules()
         return c
 
-    def _rule_row(self, exe: str, mode: str, on_exit: str) -> None:
+    def _rule_row(self, exe: str, mode: str, on_exit: str, trigger: str = TRIGGER_EXE) -> None:
         r = self.rules.rowCount()
         self.rules.insertRow(r)
+        tg = QComboBox()
+        for key, text in TRIGGER_LABELS.items():
+            tg.addItem(text, key)
+        if tg.findData(trigger) < 0:
+            tg.addItem(f"(解釈できない) {trigger}", trigger)
+        tg.setCurrentIndex(max(0, tg.findData(trigger)))
+        self.rules.setCellWidget(r, 0, tg)
         e = QLineEdit(exe)
         e.setPlaceholderText("例: game.exe")
-        self.rules.setCellWidget(r, 0, e)
+        self.rules.setCellWidget(r, 1, e)
         cb = QComboBox()
         cfg = self.svc.config if self.svc else None
         for m in (cfg.valid_modes() if cfg else []):
@@ -237,22 +254,36 @@ class ModeShiftPage(W.ScrollPage):
         if mode and cb.findData(mode) < 0:
             cb.addItem(f"(無い/無効) {mode}", mode)
         cb.setCurrentIndex(max(0, cb.findData(mode)))
-        self.rules.setCellWidget(r, 1, cb)
+        self.rules.setCellWidget(r, 2, cb)
         ox = QComboBox()
         ox.addItem("何もしない", "none")
         ox.addItem("元に戻す", "undo")
         ox.setCurrentIndex(1 if on_exit == "undo" else 0)
-        self.rules.setCellWidget(r, 2, ox)
+        self.rules.setCellWidget(r, 3, ox)
+
+        def sync(_i: int = 0) -> None:
+            t = str(tg.currentData() or TRIGGER_EXE)
+            is_exe = t == TRIGGER_EXE
+            e.setEnabled(is_exe)
+            e.setPlaceholderText("例: game.exe" if is_exe else "(電源のきっかけでは使いません)")
+            ox.setItemText(1, ON_EXIT_UNDO_LABELS.get(t, "元に戻す"))
+
+        tg.currentIndexChanged.connect(guard(sync))
+        sync()
 
     def _load_rules(self) -> None:
         self.rules.setRowCount(0)
         sec = self.module.ctx.settings_dict()
         for r in (sec.get("auto_switch") or {}).get("rules") or []:
             if isinstance(r, dict):
-                self._rule_row(str(r.get("exe") or ""), str(r.get("mode") or ""), str(r.get("on_exit") or "none"))
+                self._rule_row(str(r.get("exe") or ""), str(r.get("mode") or ""), str(r.get("on_exit") or "none"),
+                               str(r.get("trigger") or TRIGGER_EXE))
 
     def _add_rule(self) -> None:
         self._rule_row("", "", "undo")
+
+    def _add_power_rule(self) -> None:
+        self._rule_row("", "", "undo", TRIGGER_BATTERY)
 
     def _add_rule_from_proc(self) -> None:
         dlg = ProcessPicker(self, self.module, exclude_games=False, audio_first=False)
@@ -267,14 +298,21 @@ class ModeShiftPage(W.ScrollPage):
     def _collect_rules(self) -> list[dict[str, Any]]:
         out = []
         for r in range(self.rules.rowCount()):
-            e = self.rules.cellWidget(r, 0)
-            m = self.rules.cellWidget(r, 1)
-            o = self.rules.cellWidget(r, 2)
-            exe = e.text().strip().lower() if isinstance(e, QLineEdit) else ""
-            if not exe:
-                continue
-            out.append({"exe": exe, "mode": m.currentData() if isinstance(m, QComboBox) else "",
-                        "on_exit": o.currentData() if isinstance(o, QComboBox) else "none"})
+            t = self.rules.cellWidget(r, 0)
+            e = self.rules.cellWidget(r, 1)
+            m = self.rules.cellWidget(r, 2)
+            o = self.rules.cellWidget(r, 3)
+            trigger = str(t.currentData() or TRIGGER_EXE) if isinstance(t, QComboBox) else TRIGGER_EXE
+            row: dict[str, Any] = {"mode": m.currentData() if isinstance(m, QComboBox) else "",
+                                   "on_exit": o.currentData() if isinstance(o, QComboBox) else "none"}
+            if trigger == TRIGGER_EXE:
+                exe = e.text().strip().lower() if isinstance(e, QLineEdit) else ""
+                if not exe:
+                    continue
+                row = {"exe": exe, **row}          # 既存の形のまま(trigger キーを足さない)
+            else:
+                row = {"trigger": trigger, **row}
+            out.append(row)
         return out
 
     def _save_rules(self) -> None:
@@ -299,17 +337,27 @@ class ModeShiftPage(W.ScrollPage):
         cfg = self.svc.config if self.svc else None
         if cfg is None:
             return
-        if cfg.auto_active:
-            self.auto_pill.set_state("ok", f"監視中({cfg.poll_interval_s:g} 秒ごと)")
+        if cfg.auto_poll_active:
+            self.auto_pill.set_state("ok", f"監視中({cfg.poll_interval_s:g} 秒ごと)" + ("・電源" if cfg.auto_power_active else ""))
+        elif cfg.auto_power_active:
+            self.auto_pill.set_state("ok", "監視中(電源)")
         elif cfg.auto_enabled and cfg.auto_error:
             self.auto_pill.set_state("warn", "設定待ち")
         else:
             self.auto_pill.set_state("off", "オフ")
-        errs = [f"{r.exe or '(空)'}: {r.error}" for r in cfg.rules if r.error]
+        errs = [f"{r.exe or TRIGGER_LABELS.get(r.trigger, '(空)')}: {r.error}" for r in cfg.rules if r.error]
         if cfg.auto_enabled and cfg.auto_error:
             errs.insert(0, cfg.auto_error)
         self.rules_err.setText("\n".join("・" + e for e in errs))
         self.rules_err.setVisible(bool(errs))
+        ac = None
+        if self.svc is not None and any(r.is_power for r in cfg.rules):
+            try:
+                ac = self.svc.backends.power.ac_online()
+            except Exception:  # noqa: BLE001
+                log.exception("電源の状態を読めません")
+        self.power_now.setText("" if ac is None else f"今の電源: {'AC 電源' if ac else 'バッテリー'}")
+        self.power_now.setVisible(ac is not None)
 
     # ---------------------------------------------------------------- 更新
     def _on_changed(self) -> None:

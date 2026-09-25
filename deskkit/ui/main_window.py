@@ -5,18 +5,21 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import (
     Property,
     QEasingCurve,
+    QObject,
     QPropertyAnimation,
     QRectF,
     QSize,
     Qt,
     QTimer,
     QUrl,
+    Signal,
 )
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPainterPath, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
@@ -236,13 +239,73 @@ class Sidebar(QFrame):
 
 
 # ================================================================== ホーム
+HOTKEY_LIMIT = 12
+# ホットキーの表示名(登録名 → 画面に出す名前)。知らない名前は登録名をそのまま読みやすくして出す
+HOTKEY_LABELS = {
+    "host.quick": "クイックアクション",
+    "clipshelf.open_palette": "パレットを開く",
+    "clipshelf.plain_text": "書式なしで貼り付け",
+    "clipshelf.toggle_pause": "記録の一時停止/再開",
+    "dropsort.undo_last": "直前の移動を元に戻す",
+    "modeshift.undo": "モードを元に戻す",
+    "layoutkeep.save": "今の配置を保存",
+    "layoutkeep.apply": "配置を適用",
+}
+
+
+def greeting(now: _dt.datetime | None = None) -> str:
+    hour = (now or _dt.datetime.now()).hour
+    return "おはようございます" if 5 <= hour < 11 else ("こんにちは" if 11 <= hour < 18 else "こんばんは")
+
+
+def hotkey_label(full: str, modes: dict[str, str]) -> str:
+    """'modeshift.mode.game' → 'モード「ゲーム」に切り替え' など、ホットキーの登録名を画面向けの名前にする。"""
+    if full in HOTKEY_LABELS:
+        return HOTKEY_LABELS[full]
+    mod, _, rest = full.partition(".")
+    if mod == "modeshift" and rest.startswith("mode."):
+        name = rest[len("mode."):]
+        return f"モード「{modes.get(name, name)}」に切り替え"
+    return rest.replace("_", " ").replace(".", " › ") or full
+
+
+class _Clickable(QFrame):
+    """全体をクリックできる行・カードの土台。子の部品(ボタン・スイッチ)のクリックはそちらが受け取る。"""
+
+    def __init__(self, on_click: Any, hover_bg: bool = True) -> None:
+        super().__init__()
+        self._on_click = on_click
+        self._pressed = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if hover_bg:
+            self.setObjectName("ClickRow")
+            self.setStyleSheet(f"QFrame#ClickRow {{ border-radius: 8px; }} QFrame#ClickRow:hover {{ background: {T.SURFACE2}; }}")
+
+    def mousePressEvent(self, e: Any) -> None:  # noqa: N802
+        self._pressed = e.button() == Qt.MouseButton.LeftButton
+        e.accept()
+
+    def mouseReleaseEvent(self, e: Any) -> None:  # noqa: N802
+        try:
+            if self._pressed and e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+                self._pressed = False
+                self._on_click()
+        except Exception:  # noqa: BLE001 - クリック処理で落とさない
+            log.exception("クリックの処理で例外")
+        self._pressed = False
+
+
 class ModuleCard(Card):
     def __init__(self, host: Host, name: str, open_page: Any) -> None:
         info = catalog.info(name)
         super().__init__(hover=True, padding=18)
         self._host = host
         self.name = name
+        self._open_page = open_page
+        self._pressed = False
         self.setMinimumHeight(176)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"クリックで {info.title} の画面を開く")
         head = QHBoxLayout()
         g = Glyph(info.glyph, 20, info.accent)
         g.setFixedSize(44, 44)
@@ -270,6 +333,19 @@ class ModuleCard(Card):
         row.addWidget(button("開く", "ghost", G.CHEVRON, lambda: open_page(self.name)))
         self.body.addLayout(row)
         self.refresh()
+
+    # カードのどこを押しても画面を開く(ボタン・スイッチはそれぞれの動作)
+    def mousePressEvent(self, e: Any) -> None:  # noqa: N802
+        self._pressed = e.button() == Qt.MouseButton.LeftButton
+        e.accept()
+
+    def mouseReleaseEvent(self, e: Any) -> None:  # noqa: N802
+        try:
+            if self._pressed and e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+                self._open_page(self.name)
+        except Exception:  # noqa: BLE001
+            log.exception("モジュールカードのクリックで例外")
+        self._pressed = False
 
     def _toggled(self, on: bool) -> None:
         try:
@@ -301,15 +377,20 @@ class HomePage(ScrollPage):
     def __init__(self, host: Host, open_page: Any) -> None:
         super().__init__()
         self._host = host
-        hour = _dt.datetime.now().hour
-        greet = "おはようございます" if 5 <= hour < 11 else ("こんにちは" if hour < 18 else "こんばんは")
-        self.hero = Hero(greet, "DeskKit は1つの常駐プロセスで4つの QOL ツールをまとめて動かします。", G.SPARKLE, T.ACCENT)
+        self.hero = Hero(greeting(), "DeskKit は1つの常駐プロセスで4つの QOL ツールをまとめて動かします。", G.SPARKLE, T.ACCENT)
+        self.sn_pill = StatusPill("", "warn")
         self.fg_pill = StatusPill("前面ウィンドウを確認中…", "info")
         self.as_pill = StatusPill("", "off")
         self.dpi_pill = StatusPill("", "off")
+        self.hero.add_pill(self.sn_pill)
         self.hero.add_pill(self.fg_pill)
         self.hero.add_pill(self.as_pill)
         self.hero.add_pill(self.dpi_pill)
+        self.resume_btn = button("一時停止を終わる", "primary", G.PLAY, host.resume)
+        self.snooze_btn = button("1時間 一時停止", "secondary", G.PAUSE, lambda: host.snooze_for(60))
+        self.snooze_btn.setToolTip("自動で動く処理を1時間止めます(トレイの「一時停止」で時間を選べます)")
+        self.hero.add_action(self.resume_btn)
+        self.hero.add_action(self.snooze_btn)
         self.hero.add_action(button("設定を再読み込み", "secondary", G.REFRESH, host.reload))
         self.add(self.hero)
 
@@ -338,12 +419,12 @@ class HomePage(ScrollPage):
 
         lower = QHBoxLayout()
         lower.setSpacing(14)
-        self.activity = Card("最近の通知", "モジュールからのお知らせ(本文は記録しません)", G.CLOCK, T.ACCENT)
+        self.activity = Card("最近の通知", "モジュールからのお知らせ(本文は記録しません)。クリックで開きます", G.CLOCK, T.ACCENT)
         self.act_box = QVBoxLayout()
-        self.act_box.setSpacing(6)
+        self.act_box.setSpacing(2)
         self.activity.add_layout(self.act_box)
         lower.addWidget(self.activity, 3)
-        self.keys = Card("ホットキー", "登録中の組み合わせ(名前のみ)", G.KEYBOARD, T.ACCENT)
+        self.keys = Card("ホットキー", "登録中の組み合わせ", G.KEYBOARD, T.ACCENT)
         self.keys_box = QVBoxLayout()
         self.keys_box.setSpacing(6)
         self.keys.add_layout(self.keys_box)
@@ -355,6 +436,7 @@ class HomePage(ScrollPage):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(2000)
+        host.signals.snooze_changed.connect(self._sync_snooze)
         self.refresh()
 
     def _tick(self) -> None:
@@ -376,7 +458,20 @@ class HomePage(ScrollPage):
         except Exception:  # noqa: BLE001
             log.exception("前面ウィンドウの表示更新で例外")
 
+    def _sync_snooze(self) -> None:
+        try:
+            text = self._host.snooze.status_text()
+            self.sn_pill.set_state("warn", text)
+            self.sn_pill.setVisible(bool(text))
+            manual = self._host.snooze.manual_active()
+            self.resume_btn.setVisible(manual)
+            self.snooze_btn.setVisible(not manual)
+        except RuntimeError:  # 画面破棄後
+            pass
+
     def refresh(self) -> None:
+        self.hero.set_title(greeting())
+        self._sync_snooze()
         for c in self.cards.values():
             c.refresh()
         slots = self._host.loader.slots.values()
@@ -391,19 +486,38 @@ class HomePage(ScrollPage):
                                {"on": "自動起動 オン", "off": "自動起動 オフ", "mismatch": "自動起動 パス不一致"}[st])
         dpi = self._host.dpi_awareness
         self.dpi_pill.set_state("ok" if dpi == "per_monitor_aware_v2" else "warn", f"DPI {dpi}")
+        self._render_hotkeys(names)
+        self._render_activity()
+
+    def _render_hotkeys(self, names: list[str]) -> None:
+        from deskkit.context import list_modes
+
         _clear(self.keys_box)
         if not names:
             self.keys_box.addWidget(label("登録されているホットキーはありません", "Mute"))
-        for n in names[:12]:
-            mod, _, rest = n.partition(".")
+            return
+        modes = dict(list_modes(self._host.settings.module_section("modeshift")))
+        order = sorted(names, key=lambda n: (n.partition(".")[0] != "host", n))
+        for n in order[:HOTKEY_LIMIT]:
+            mod = n.partition(".")[0]
             row = QHBoxLayout()
             is_host = mod == "host"
             chip = QLabel(APP_NAME if is_host else catalog.info(mod).title)
             chip.setStyleSheet(f"color: {T.ACCENT if is_host else catalog.info(mod).accent}; font-weight: 600; font-size: 12px;")
             row.addWidget(chip)
-            row.addWidget(label(rest, "Dim"), 1)
+            name_l = label(hotkey_label(n, modes), "Dim")
+            name_l.setMinimumWidth(0)
+            row.addWidget(name_l, 1)
+            combo = self._host.hotkeys.combo_text(n)
+            if combo:
+                key = QLabel(combo)
+                key.setStyleSheet(f"color: {T.TEXT}; background: {T.SURFACE2}; border: 1px solid {T.BORDER}; border-radius: 6px;"
+                                  " padding: 1px 7px; font-size: 11px;")
+                row.addWidget(key)
             self.keys_box.addLayout(row)
-        self._render_activity()
+        rest = len(order) - HOTKEY_LIMIT
+        if rest > 0:
+            self.keys_box.addWidget(label(f"他 {rest} 件", "Mute"))
 
     def _render_activity(self) -> None:
         _clear(self.act_box)
@@ -420,9 +534,10 @@ class HomePage(ScrollPage):
 
 
 def _activity_row(a: Activity, host: Host) -> QWidget:
-    w = QWidget()
+    w = _Clickable(lambda: host.open_activity(a))
+    w.setToolTip("クリックして開く")
     lay = QHBoxLayout(w)
-    lay.setContentsMargins(0, 2, 0, 2)
+    lay.setContentsMargins(6, 3, 6, 3)
     color = {"ok": T.SUCCESS, "warn": T.WARN, "error": T.DANGER}.get(a.level, T.INFO if a.source == "host" else catalog.info(a.source).accent)
     dot = QLabel("●")
     dot.setStyleSheet(f"color: {color}; font-size: 10px;")
@@ -434,6 +549,7 @@ def _activity_row(a: Activity, host: Host) -> QWidget:
     t = label(a.title, "Dim")
     t.setMinimumWidth(0)
     lay.addWidget(t, 1)
+    lay.addWidget(Glyph(G.CHEVRON, 10, T.TEXT_MUTE))
     return w
 
 
@@ -585,20 +701,56 @@ class SettingsPage(ScrollPage):
         fs = Segmented([("rect", "画面全体を覆えば全画面"), ("off", "判定しない")], str(hs.get("fullscreen_detection", "rect")))
         fs.changed.connect(lambda v: self._save_host({"fullscreen_detection": v}))
         game.add(SettingRow("全画面の判定", "前面ウィンドウがモニタ全体を覆っているかで判定します。", fs, G.MONITOR))
+        hold = ToggleSwitch(bool(hs.get("hold_notifications", True)))
+        hold.toggled.connect(lambda on: self._save_host({"hold_notifications": on}))
+        game.add(SettingRow("この間は通知を保留する", "エラー以外の通知をためておき、終わってから「保留中の通知 N 件」として1つにまとめて出します。"
+                            "ホームの「最近の通知」にはすぐ記録されます。", hold, G.INFO))
         self.add(game)
 
+        # ---- 一時停止
+        sn = Card("一時停止", "自動で動く処理(DropSort の自動移動・LayoutKeep の自動適用・ModeShift の自動切替・ClipShelf の記録など)を"
+                  "しばらく止めます。ボタンやクイックアクションで手で行う操作はそのまま使えます。DeskKit を再起動すると解除されます。",
+                  G.PAUSE, T.ACCENT)
+        srow = QHBoxLayout()
+        self.snooze_pill = StatusPill()
+        srow.addWidget(self.snooze_pill)
+        srow.addStretch(1)
+        for text, minutes in (("30分", 30), ("1時間", 60), ("再開するまで", None)):
+            srow.addWidget(button(text, "secondary", None, partial(host.snooze_for, minutes)))
+        self.resume_btn = button("再開", "primary", G.PLAY, host.resume)
+        srow.addWidget(self.resume_btn)
+        sn.add_layout(srow)
+        quns = ToggleSwitch(bool(hs.get("snooze_follow_quns", False)))
+        quns.toggled.connect(self._quns_toggled)
+        sn.add(SettingRow("Windows がプレゼン中・通知を控えている間も一時停止", "プレゼンテーション表示・全画面の Direct3D・"
+                          "Windows が通知を控えている状態(SHQueryUserNotificationState)の間も、一時停止として扱います。", quns, G.MONITOR))
+        self.add(sn)
+        host.signals.snooze_changed.connect(self._sync_snooze)
+        self._sync_snooze()
+
         adv = Card("詳細", None, G.FILTER, T.ACCENT)
-        lim = QSpinBox()
-        lim.setRange(1, 100)
-        lim.setValue(int(hs.get("handler_error_limit", 5)))
-        lim.valueChanged.connect(lambda v: self._save_host({"handler_error_limit": int(v)}))
-        adv.add(SettingRow("例外の許容回数", "同じ処理で例外がこの回数続いたら、そのモジュールだけを停止します。", lim, G.SHIELD))
-        ret = QSpinBox()
-        ret.setRange(1, 365)
-        ret.setSuffix(" 日")
-        ret.setValue(int(hs.get("log_retention_days", 14)))
-        ret.valueChanged.connect(lambda v: self._save_host({"log_retention_days": int(v)}))
-        adv.add(SettingRow("ログの保存日数", "日ごとに分けて保存し、古いものから削除します。", ret, G.LOG))
+        # 数値欄は1段ごとに settings.json を書かない(入力が 700 ms 止まってからまとめて保存する)
+        self._adv_timer = QTimer(self)
+        self._adv_timer.setSingleShot(True)
+        self._adv_timer.setInterval(700)
+        self._adv_timer.timeout.connect(self._save_adv)
+        self.lim = QSpinBox()
+        self.lim.setRange(1, 100)
+        self.lim.setValue(int(hs.get("handler_error_limit", 5)))
+        self.lim.valueChanged.connect(lambda _v: self._adv_timer.start())
+        adv.add(SettingRow("例外の許容回数", "同じ処理で例外がこの回数続いたら、そのモジュールだけを停止します。", self.lim, G.SHIELD))
+        self.ret = QSpinBox()
+        self.ret.setRange(1, 365)
+        self.ret.setSuffix(" 日")
+        self.ret.setValue(int(hs.get("log_retention_days", 14)))
+        self.ret.valueChanged.connect(lambda _v: self._adv_timer.start())
+        adv.add(SettingRow("ログの保存日数", "日ごとに分けて保存し、古いものから削除します。", self.ret, G.LOG))
+        self.keep = QSpinBox()
+        self.keep.setRange(1, 200)
+        self.keep.setSuffix(" 世代")
+        self.keep.setValue(int(hs.get("settings_history_keep", 20)))
+        self.keep.valueChanged.connect(lambda _v: self._adv_timer.start())
+        adv.add(SettingRow("設定の世代を残す数", "settings.json を変更するたびに自動で残す世代の数。古いものから消します。", self.keep, G.SAVE))
         self.add(adv)
 
         files = Card("ファイルの置き場所", None, G.FOLDER, T.ACCENT)
@@ -672,6 +824,24 @@ class SettingsPage(ScrollPage):
         bk.add(label("書き出したファイルにはフォルダのパスや exe のパスが含まれます。人に渡すときは中身を確認してください。", "Mute", wrap=True))
         self.add(bk)
 
+        # ---- 設定の世代(自動)
+        self.hist = Card("設定の世代", "settings.json を変更するたびに、その時点の内容を自動で残しています(数秒以内の連続した変更は1つにまとめます)。"
+                         "戻すと、今の設定も1世代として残してから置き換え、「設定を再読み込み」と同じように反映します。", G.CLOCK, T.ACCENT)
+        self.hist_box = QVBoxLayout()
+        self.hist_box.setSpacing(4)
+        self.hist.add_layout(self.hist_box)
+        self.add(self.hist)
+        host.signals.snapshots_changed.connect(self.refresh_history)
+        self.refresh_history()
+
+        # ---- 診断
+        dg = Card("診断レポート", "不具合を相談するときに貼り付ける、DeskKit の状態の要約です。版・OS・画面の倍率・モジュールの状態・"
+                  "ホットキーの競合などを含み、パス・ユーザー名・exe 名・ウィンドウタイトル・クリップボードや URL の中身は含みません。",
+                  G.INFO, T.ACCENT)
+        dg.add(SettingRow("診断レポートをコピー", "クリップボードにコピーします。貼り付ける前に中身を確認できます。",
+                          button("コピー", "secondary", G.COPY, host.copy_diagnostics), G.COPY))
+        self.add(dg)
+
         about = Card(f"{APP_NAME} {__version__}", "この道具がしないこと", G.SHIELD, T.SUCCESS)
         for s in ("通信するのはアップデートの確認とダウンロード(GitHub)だけです。上の設定でオフにできます。",
                   "キーボードやマウスの入力を横取りしません(ホットキーは Windows の RegisterHotKey のみ)。",
@@ -680,6 +850,69 @@ class SettingsPage(ScrollPage):
             about.add(label("✓  " + s, "Dim", wrap=True))
         self.add(about)
         self.finish()
+
+    def _save_adv(self) -> None:
+        self._save_host({"handler_error_limit": int(self.lim.value()), "log_retention_days": int(self.ret.value()),
+                         "settings_history_keep": int(self.keep.value())})
+
+    def _quns_toggled(self, on: bool) -> None:
+        self._save_host({"snooze_follow_quns": on})
+        self._host.snooze.sync_settings()
+
+    def _sync_snooze(self) -> None:
+        try:
+            text = self._host.snooze.status_text()
+            self.snooze_pill.set_state("warn" if text else "ok", text or "動作中(一時停止していません)")
+            self.resume_btn.setVisible(self._host.snooze.manual_active())
+        except RuntimeError:  # 画面破棄後
+            pass
+
+    def refresh_history(self) -> None:
+        from deskkit import backup
+
+        try:
+            _clear(self.hist_box)
+            snaps = self._host.snapshots.list()
+        except RuntimeError:
+            return
+        except OSError:
+            snaps = []
+        if not snaps:
+            self.hist_box.addWidget(label("まだ世代はありません", "Mute"))
+            return
+        today = _dt.date.today()
+        for i, s in enumerate(snaps):
+            row = QHBoxLayout()
+            when = f"{s.ts:%H:%M:%S}" if s.ts.date() == today else f"{s.ts:%Y-%m-%d %H:%M}"
+            tl = label(when + ("  (最新)" if i == 0 else ""), "H3" if i == 0 else None)
+            tl.setMinimumWidth(150)
+            row.addWidget(tl)
+            try:
+                summ = "  ・  ".join(backup.summary(self._host.snapshots.read(s)))
+            except SettingsError:
+                summ = "(読めない世代です)"
+            sl = label(summ, "Mute", wrap=True)  # 折り返さないとページ全体が横にはみ出す
+            row.addWidget(sl, 1)
+            if i > 0:
+                row.addWidget(button("この世代に戻す", "ghost", G.UNDO, partial(self._restore, s)))
+            self.hist_box.addLayout(row)
+
+    def _restore(self, snap: Any) -> None:
+        from deskkit import backup
+
+        try:
+            data = self._host.snapshots.read(snap)
+        except SettingsError as e:
+            message(self.window(), "この世代を読めません", str(e), kind="error")
+            return
+        text = f"{snap.ts:%Y-%m-%d %H:%M:%S} の設定\n" + "\n".join(backup.summary(data)) + "\n\n今の設定も1世代として残してから置き換えます。"
+        ok, _ = confirm(self.window(), "この世代に戻しますか?", text, ok_text="戻す")
+        if not ok:
+            return
+        try:
+            self._host.restore_snapshot(snap)
+        except (OSError, SettingsError) as e:
+            message(self.window(), "戻せませんでした", str(e), kind="error")
 
     def _theme_changed(self, v: str) -> None:
         self._save_host({"theme": v})
@@ -791,6 +1024,12 @@ def _opener(path: str) -> Any:
 
 
 # ================================================================== ログ
+class _LogRelay(QObject):
+    """ログの行を GUI スレッドへ運ぶ中継。logging はどのスレッドからでも呼ばれるので、画面にはここから先でだけ触る。"""
+
+    record = Signal(object)
+
+
 class LogsPage(QWidget):
     LEVELS = {"all": 0, "info": 20, "warn": 30, "error": 40}
 
@@ -813,14 +1052,19 @@ class LogsPage(QWidget):
         bar.addWidget(self.level)
         self.source = QComboBox()
         self.source.addItem("全モジュール", "")
-        self.source.addItem("host", "deskkit.host")
+        self.source.addItem(f"{APP_NAME} 本体", "deskkit.host")
         for m in catalog.MODULES:
             self.source.addItem(m.title, f"deskkit.{m.name}")
         self.source.currentIndexChanged.connect(lambda _i: self.rebuild())
         bar.addWidget(self.source)
         self.search = QLineEdit()
         self.search.setPlaceholderText("絞り込み")
-        self.search.textChanged.connect(lambda _t: self.rebuild())
+        # 1文字ごとに全件を描き直さない(200 ms 入力が止まってから絞り込む)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self.rebuild)
+        self.search.textChanged.connect(lambda _t: self._search_timer.start())
         bar.addWidget(self.search, 1)
         lay.addLayout(bar)
         self.view = QPlainTextEdit()
@@ -832,7 +1076,10 @@ class LogsPage(QWidget):
         self.view.setFont(mono)
         self.view.setStyleSheet(f"QPlainTextEdit {{ background: {T.SURFACE}; border-radius: 12px; padding: 10px; }}")
         lay.addWidget(self.view, 1)
+        self._relay = _LogRelay(self)
+        self._relay.record.connect(self._on_record_gui, Qt.ConnectionType.QueuedConnection)
         memory_tail.listeners.append(self._on_record)
+        self.destroyed.connect(lambda _o=None, cb=self._on_record: _remove_listener(cb))
         self.rebuild()
 
     def _match(self, r: logging.LogRecord) -> bool:
@@ -861,17 +1108,31 @@ class LogsPage(QWidget):
 
     def rebuild(self) -> None:
         self.view.clear()
-        for r in memory_tail.records:
+        for r in list(memory_tail.records):
             if self._match(r):
                 self._append(r)
         self.view.moveCursor(QTextCursor.MoveOperation.End)
 
     def _on_record(self, r: logging.LogRecord) -> None:
+        """logging のスレッドから呼ばれる。部品には触らず、GUI スレッドへ送るだけ。"""
+        try:
+            self._relay.record.emit(r)
+        except RuntimeError:  # 画面破棄後
+            _remove_listener(self._on_record)
+
+    def _on_record_gui(self, r: logging.LogRecord) -> None:
         try:
             if self._match(r):
                 self._append(r)
         except RuntimeError:  # 画面破棄後
             pass
+
+
+def _remove_listener(cb: Any) -> None:
+    try:
+        memory_tail.listeners.remove(cb)
+    except ValueError:
+        pass
 
 
 # ================================================================== ウィンドウ
@@ -909,6 +1170,7 @@ class ControlCenter(QMainWindow):
         host.signals.module_changed.connect(self._module_changed)
         host.signals.activity.connect(self._activity)
         host.signals.settings_reloaded.connect(self._reloaded)
+        host.signals.settings_replaced.connect(self._rebuild_settings)
         self._hint_shown = False
         self._refresh_dots()
         QTimer.singleShot(0, lambda: self.open_page("home", animate=False))
@@ -949,6 +1211,21 @@ class ControlCenter(QMainWindow):
         self.home.refresh()
         self.settings_page.sync()
         self._refresh_dots()
+
+    def _rebuild_settings(self) -> None:
+        """設定の再読み込み・世代の復元の後、設定画面を今の値で作り直す(表示中ならそのまま差し替える)。"""
+        old = self.settings_page
+        new = SettingsPage(self._host)
+        idx = self.stack.indexOf(old)
+        self.stack.insertWidget(idx, new)
+        if self.stack.currentWidget() is old:
+            pos = old.verticalScrollBar().value()
+            self.stack.setCurrentWidget(new)
+            QTimer.singleShot(0, lambda: new.verticalScrollBar().setValue(pos))
+        self.stack.removeWidget(old)
+        old.deleteLater()
+        self.pages["settings"] = new
+        self.settings_page = new
 
     def _refresh_dots(self) -> None:
         for m in catalog.MODULES:

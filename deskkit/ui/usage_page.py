@@ -1,13 +1,15 @@
 # 利用状況ページ。動作中の各モジュールの usage(days) を呼び、指標ごとの小さな棒グラフ(1系列1グラフ)にする。
 # 色はモジュールの識別色(theme.chart_color。明度帯・色覚差を検証済み)。文字は常に文字色。棒にマウスを載せると日付と件数。
-# 表示するのは日ごとの件数だけ(本文・パスは扱わない)。表でも見られる。
+# 表示するのは日ごとの件数だけ(本文・パスは扱わない)。表でも見られる。usage() は別スレッドで集計し、期間ごとに結果を覚える(UX-5)。
 from __future__ import annotations
 
 import datetime as _dt
 import logging
+import threading
+import time
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QPoint, QRectF, Qt
+from PySide6.QtCore import QObject, QPoint, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QGridLayout,
@@ -169,19 +171,51 @@ def _series_card(s: UsageSeries, color: str, end: _dt.date) -> QWidget:
     return w
 
 
+CACHE_TTL_S = 120.0  # 同じ期間をこの時間内に開き直したら集計し直さない
+Results = dict[str, "list[UsageSeries] | BaseException"]
+
+
+class _UsageRelay(QObject):
+    """集計スレッドの結果を GUI スレッドへ運ぶ。"""
+
+    done = Signal(int, object)  # (token, Results)
+
+
+def collect_usage(running: list[tuple[str, Any]], days: int) -> Results:
+    """各モジュールの usage(days) を呼ぶ(集計スレッドで実行)。例外はそのモジュールの結果として返す。"""
+    out: Results = {}
+    for name, mod in running:
+        fn = getattr(mod, "usage", None)
+        if fn is None:
+            out[name] = []
+            continue
+        try:
+            got = fn(days)
+            out[name] = [s for s in (got or []) if isinstance(s, UsageSeries)]
+        except Exception as e:  # noqa: BLE001 - モジュールの例外で集計全体を止めない
+            out[name] = e
+    return out
+
+
 class UsagePage(ScrollPage):
+    """usage() は重い・例外を出すものとして扱い、別スレッドで集計する。期間ごとに結果を覚え、期間と表示の選択は設定に残す。"""
+
     def __init__(self, host: Host) -> None:
         super().__init__()
         self._host = host
+        hs = host.settings.host()
         hero = Hero("利用状況", "各モジュールがどれくらい役に立っているか。使われていない道具は、仕様書の撤退基準で見直しの目安にできます。",
                     G.LIST, T.ACCENT)
-        self.period = Segmented([("7", "7日"), ("30", "30日"), ("90", "90日")], "30")
-        self.period.changed.connect(lambda _v: self.refresh())
-        self.view = Segmented([("chart", "グラフ"), ("table", "表")], "chart")
-        self.view.changed.connect(lambda _v: self.refresh())
+        self.period = Segmented([("7", "7日"), ("30", "30日"), ("90", "90日")], str(hs.get("usage_period", "30")))
+        self.period.changed.connect(self._period_changed)
+        self.view = Segmented([("chart", "グラフ"), ("table", "表")], str(hs.get("usage_view", "chart")))
+        self.view.changed.connect(self._view_changed)
         hero.add_action(self.period)
         hero.add_action(self.view)
         hero.add_pill(StatusPill("件数だけを集計(本文は扱いません)", "info"))
+        self.loading = StatusPill("集計しています…", "accent")
+        self.loading.hide()
+        hero.add_pill(self.loading)
         self.add(hero)
         self.box = QVBoxLayout()
         self.box.setSpacing(16)
@@ -189,28 +223,113 @@ class UsagePage(ScrollPage):
         holder.setLayout(self.box)
         self.add(holder)
         self.finish()
+        self._cache: dict[int, tuple[float, tuple[str, ...], dict[str, list[UsageSeries]]]] = {}
+        self._pending: dict[int, tuple[int, tuple[str, ...]]] = {}  # token → (days, 集計したモジュール)
+        self._token = 0
+        self._relay = _UsageRelay(self)
+        self._relay.done.connect(self._on_done)
 
-    def refresh(self) -> None:
+    # ---- 期間・表示の切り替え(選択は host 設定に残す)
+    def _period_changed(self, v: str) -> None:
+        self._save({"usage_period": v})
+        self.refresh()
+
+    def _view_changed(self, v: str) -> None:
+        self._save({"usage_view": v})
+        self.refresh()
+
+    def _save(self, values: dict[str, Any]) -> None:
+        try:
+            self._host.settings.write_host(values)
+        except Exception:  # noqa: BLE001 - 表示の選択を残せなくても画面は動かす
+            log.warning("利用状況の表示設定を保存できません")
+
+    def _running(self) -> list[tuple[str, Any]]:
+        out = []
+        for m in catalog.MODULES:
+            slot = self._host.loader.slots.get(m.name)
+            if slot is not None and slot.state == "running" and slot.module is not None and slot.ctx is not None:
+                out.append((m.name, slot.module))
+        return out
+
+    # ---- 集計
+    def refresh(self, force: bool = False) -> None:
+        days = int(self.period.value())
+        running = self._running()
+        key = tuple(n for n, _ in running)
+        cached = self._cache.get(days)
+        if cached is not None and cached[1] == key:
+            self._render(days, cached[2])  # 古くても先に出しておく
+            if not force and time.monotonic() - cached[0] < CACHE_TTL_S:
+                self.loading.hide()
+                return
+        elif not running:
+            self._render(days, {})
+            return
+        self._start(days, running, key)
+
+    def _start(self, days: int, running: list[tuple[str, Any]], key: tuple[str, ...]) -> None:
+        self._token += 1
+        token = self._token
+        self._pending[token] = (days, key)
+        self.loading.show()
+        relay = self._relay
+
+        def work() -> None:
+            res = collect_usage(running, days)
+            try:
+                relay.done.emit(token, res)
+            except RuntimeError:  # 画面が先に破棄された
+                pass
+
+        threading.Thread(target=work, name="deskkit-usage", daemon=True).start()
+
+    def _on_done(self, token: int, res: Results) -> None:
+        try:
+            days, key = self._pending.pop(token)
+        except KeyError:
+            return
+        final: dict[str, list[UsageSeries]] = {}
+        for name, r in res.items():
+            if isinstance(r, BaseException):
+                final[name] = self._retry_on_gui(name, days, r)
+            else:
+                final[name] = r
+        self._cache[days] = (time.monotonic(), key, final)
+        if token != self._token:
+            return  # 後から頼んだ集計がある(結果は覚えておく)
+        self.loading.hide()
+        if int(self.period.value()) == days:
+            self._render(days, final)
+
+    def _retry_on_gui(self, name: str, days: int, err: BaseException) -> list[UsageSeries]:
+        """別スレッドで失敗した usage() を GUI スレッドでもう一度だけ呼ぶ(SQLite の接続などスレッドに縛られたものがあるため)。"""
+        log.info("usage() failed off the GUI thread module=%s error=%s; retrying on GUI thread", name, type(err).__name__)
+        slot = self._host.loader.slots.get(name)
+        if slot is None or slot.state != "running" or slot.module is None or slot.ctx is None:
+            return []
+        fn = getattr(slot.module, "usage", None)
+        if fn is None:
+            return []
+        got = slot.ctx.safe(fn, "usage")(days)
+        return [s for s in (got or []) if isinstance(s, UsageSeries)]
+
+    # ---- 描画
+    def _render(self, days: int, results: dict[str, list[UsageSeries]]) -> None:
         while self.box.count():
             it = self.box.takeAt(0)
             w = it.widget() if it is not None else None
             if w is not None:
                 w.deleteLater()
-        days = int(self.period.value())
         end = _dt.date.today()
         any_running = False
         for m in catalog.MODULES:
-            slot = self._host.loader.slots.get(m.name)
-            if slot is None or slot.state != "running" or slot.module is None or slot.ctx is None:
+            if m.name not in results:
                 continue
             any_running = True
             color = T.chart_color(m.name)
             card = Card(m.title, m.tagline, m.glyph, m.accent)
-            fn = getattr(slot.module, "usage", None)
-            series: list[UsageSeries] = []
-            if fn is not None:
-                got = slot.ctx.safe(fn, "usage")(days)
-                series = [s for s in (got or []) if isinstance(s, UsageSeries)]
+            series = results[m.name]
             if not series:
                 card.add(label("このモジュールはまだ集計できるデータがありません。", "Mute"))
                 self.box.addWidget(card)

@@ -1,5 +1,6 @@
-# Control Center の LayoutKeep 画面。モード切替・モニタマップ・保存済みレイアウト一覧・計画表・targets 編集・
-# タイミング / ID 方式・ホットキー・操作履歴をまとめて表示する。設定の変更は即 ctx.write_settings で保存する。
+# Control Center の LayoutKeep 画面。モード切替・モニタマップ・プリセット・保存済みレイアウト一覧・計画表・
+# 自動スナップショット・新規ウィンドウの配置・targets 編集・タイミング / ID 方式・ホットキー・操作履歴を表示する。
+# 設定の変更は即 ctx.write_settings で保存する。
 # 画面にはタイトルを出さない(「今開いているウィンドウから選ぶ」ダイアログ内だけ例外)。スロットはすべて例外を握る。
 from __future__ import annotations
 
@@ -27,9 +28,21 @@ from deskkit.ui.theme import G
 
 from . import config
 from .dialogs import pick_windows
-from .model import ID_SOURCES, Layout, RawMonitor, as_dict, as_list, exe_basename, rect_text
+from .model import (
+    AUTO_BEFORE,
+    AUTO_SLOT_KEYS,
+    ID_SOURCES,
+    Layout,
+    PresetSet,
+    RawMonitor,
+    as_dict,
+    as_list,
+    exe_basename,
+    rect_text,
+    validate_preset_name,
+)
 from .monitor_map import MapBox, MapMonitor, MonitorMap
-from .monitors import primary_work_origin
+from .monitors import workspace_to_screen
 from .planner import Plan
 from .store import BrokenLayoutError, LayoutSummary
 from .windows import pickable
@@ -40,8 +53,15 @@ if TYPE_CHECKING:
 log = logging.getLogger("deskkit.layoutkeep.page")
 
 ACTION_LABELS = {"save": "保存", "plan": "計画(試運転)", "apply": "適用", "undo": "取り消し", "propose": "提案",
-                 "suppressed": "抑止"}
-SOURCE_LABELS = {"tray": "トレイ", "hotkey": "ホットキー", "auto": "自動", "event": "イベント", "gui": "画面", "cli": "CLI"}
+                 "suppressed": "抑止", "snapshot": "自動保存", "place": "新規ウィンドウ", "preset": "プリセット"}
+SOURCE_LABELS = {"tray": "トレイ", "hotkey": "ホットキー", "auto": "自動", "event": "イベント", "gui": "画面", "cli": "CLI",
+                 "quick": "クイック"}
+PRESET_RESULT_LABELS = {"rename": "名前を変更", "default": "既定にした", "delete": "削除"}
+PLACE_ACTION_LABELS = {"would_move": "動かす予定(試運転)", "moved": "動かした", "skip": "動かさない"}
+PLACE_KEY_LABELS = {"move": "保存位置へ", "ambiguous": "同じアプリの窓を区別できない", "not_matched": "対応する保存エントリなし",
+                    "not_target": "対象外", "no_layout": "この構成のプリセットなし", "no_signature": "構成を計算できない",
+                    "elevated": "管理者権限の窓", "elevated_unknown": "権限を確認できない窓", "unchanged": "既に保存位置",
+                    "set_failed": "動かせなかった", "undo_failed": "undo.json を書けない"}
 SKIP_LABELS = {"not_running": "未起動", "ambiguous": "曖昧", "unchanged": "既に同じ位置", "set_failed": "失敗", "gone": "閉じた"}
 
 
@@ -115,6 +135,8 @@ class LayoutKeepPage(W.ScrollPage):
         info = catalog.info("layoutkeep")
         self.accent = info.accent
         self._shown_sig: str | None = None  # マップに出しているレイアウト(None なら現在の構成)
+        self._shown_preset: str | None = None  # マップに出しているプリセット名(None なら既定。「自動」「抜く前」も可)
+        self._preset_set: PresetSet | None = None
         self._loading = False
         self._layouts: list[LayoutSummary] = []
         self._entries_layout: Layout | None = None
@@ -122,8 +144,11 @@ class LayoutKeepPage(W.ScrollPage):
         self._build_disabled_banner()
         self._build_stats()
         self._build_map_card()
+        self._build_presets_card()
         self._build_plan_card()
         self._build_layouts_card()
+        self._build_snapshot_card()
+        self._build_place_card()
         self._build_targets_card()
         self._build_timing_card()
         self._build_hotkeys_card()
@@ -181,7 +206,9 @@ class LayoutKeepPage(W.ScrollPage):
         self.pill_prop = W.StatusPill("提案中", "accent")
         self.pill_saved = W.StatusPill("保存しました", "ok")
         self.pill_saved.hide()
-        for p in (self.pill_mode, self.pill_cfg, self.pill_prop, self.pill_saved):
+        self.pill_snooze = W.StatusPill("一時停止中(自動の処理を止めています)", "warn")
+        self.pill_snooze.hide()
+        for p in (self.pill_mode, self.pill_cfg, self.pill_prop, self.pill_snooze, self.pill_saved):
             hero.add_pill(p)
         self.seg_mode = W.Segmented([("dry_run", "試運転"), ("live", "本番")], self.mod.cfg.mode, self.accent)
         self.seg_mode.changed.connect(self._s(self._on_mode, "mode"))
@@ -238,12 +265,14 @@ class LayoutKeepPage(W.ScrollPage):
                                           "対象のウィンドウ(targets)を並べてから「現在の配置を保存」を押してください。")
         c.add(self.tbl_entries)
         c.add(self.empty_entries)
-        self.btn_save = W.button("現在の配置を保存", "primary", G.SAVE, on_click=self._s(self._save, "save"))
+        self.btn_save = W.button("現在の配置を既定に保存", "primary", G.SAVE, on_click=self._s(self._save, "save"))
         self.btn_plan = W.button("計画を見る(動かさない)", "secondary", G.EYE, on_click=self._s(self._plan, "plan"))
         self.btn_apply = W.button("配置を戻す", "secondary", G.PLAY, on_click=self._s(self._apply, "apply"))
         self.btn_undo = W.button("直前の適用を元に戻す", "ghost", G.UNDO, on_click=self._s(self._undo, "undo"))
         self.btn_name = W.button("この構成に名前を付ける", "ghost", G.EDIT, on_click=self._s(self._name_current, "name"))
-        c.add_layout(W.hbox(self.btn_save, self.btn_plan, self.btn_apply, None, self.btn_name, self.btn_undo))
+        # 1行に5個並べるとページが横にはみ出すので、2行に分ける
+        c.add_layout(W.hbox(self.btn_save, self.btn_plan, self.btn_apply, None))
+        c.add_layout(W.hbox(self.btn_name, self.btn_undo, None))
         self.add(c)
 
     @staticmethod
@@ -253,6 +282,77 @@ class LayoutKeepPage(W.ScrollPage):
         style = "dashed" if dashed else "solid"
         sw.setStyleSheet(f"background: {T.alpha(color, 0.0 if dashed else 0.25)}; border: 1px {style} {color}; border-radius: 3px;")
         return _w(W.hbox(sw, W.label(text, "Mute"), spacing=6))
+
+    # ================================================================ プリセット
+    def _build_presets_card(self) -> None:
+        c = W.Card("プリセット", "1つの構成(モニタの組み合わせ)に名前付きの配置をいくつでも持てます(例: 作業用・配信用)。"
+                   "構成が変わったときの提案・自動適用は「既定」を使います。選ぶとマップと表に表示します。", G.PIN, self.accent)
+        self.pill_preset = W.StatusPill("既定", "info")
+        c.add_header_widget(self.pill_preset)
+        self.tbl_presets = _table(["名前", "既定", "ウィンドウ", "保存日時", "種類"], 0, height=150)
+        self.tbl_presets.itemSelectionChanged.connect(self._s(self._on_preset_select, "preset_select"))
+        c.add(self.tbl_presets)
+        self.btn_p_saveas = W.button("名前を付けて保存", "primary", G.SAVE, on_click=self._s(self._preset_save_as, "p_saveas"))
+        self.btn_p_overwrite = W.button("選択に上書き保存", "secondary", G.SAVE,
+                                        on_click=self._s(self._preset_overwrite, "p_overwrite"))
+        self.btn_p_plan = W.button("計画(試運転)", "secondary", G.EYE, on_click=self._s(self._preset_plan, "p_plan"))
+        self.btn_p_apply = W.button("適用", "secondary", G.PLAY, on_click=self._s(self._preset_apply, "p_apply"))
+        self.btn_p_default = W.button("既定にする", "ghost", G.CHECK, on_click=self._s(self._preset_default, "p_default"))
+        self.btn_p_rename = W.button("名前を変更", "ghost", G.EDIT, on_click=self._s(self._preset_rename, "p_rename"))
+        self.btn_p_delete = W.button("削除", "danger", G.DELETE, on_click=self._s(self._preset_delete, "p_delete"))
+        # 1行に7個並べるとページが横にはみ出すので、操作と管理の2行に分ける
+        c.add_layout(W.hbox(self.btn_p_saveas, self.btn_p_overwrite, self.btn_p_plan, self.btn_p_apply, None))
+        c.add_layout(W.hbox(self.btn_p_default, self.btn_p_rename, self.btn_p_delete, None))
+        self.lbl_p_hint = W.label("", "Mute", wrap=True)
+        c.add(self.lbl_p_hint)
+        self.add(c)
+
+    # ================================================================ 自動スナップショット(L2)
+    def _build_snapshot_card(self) -> None:
+        c = W.Card("自動スナップショット", "構成が落ち着いている間、対象ウィンドウの配置を自動で控えておきます(DeskKit のデータを書くだけで、"
+                   "ウィンドウは動かしません)。モニタを抜く・スリープする直前の控えは「抜く前」として残り、戻すときに選べます。"
+                   "同じ配置なら書き込みません。利用者のプリセットは上書きしません。", G.CLOCK, self.accent)
+        cfg = self.mod.cfg
+        self.tg_snap = W.ToggleSwitch(cfg.snapshot_enabled, self.accent)
+        self.tg_snap.toggled.connect(self._s(lambda on: self._set_nested("auto_snapshot", "enabled", bool(on)), "snap_on"))
+        c.add(W.SettingRow("自動で控える", "一時停止中・ゲームや全画面が前面の間は控えません。", self.tg_snap, G.CLOCK))
+        self.sp_snap_stable = self._spin(1, 240, 1, " 分", cfg.snapshot_stable_min)
+        self.sp_snap_interval = self._spin(5, 1440, 5, " 分", cfg.snapshot_interval_min)
+        c.add(W.SettingRow("落ち着いてから", "構成が変わってからこの時間たったら1回目を控えます。", self.sp_snap_stable, G.CHECK))
+        c.add(W.SettingRow("その後の間隔", "以後この間隔で控えます(同じ配置なら書きません)。", self.sp_snap_interval, G.REFRESH))
+        self._snap_timer = QTimer(self)
+        self._snap_timer.setSingleShot(True)
+        self._snap_timer.setInterval(700)
+        self._snap_timer.timeout.connect(self._s(self._save_snap_timing, "snap_timing"))
+        for sp in (self.sp_snap_stable, self.sp_snap_interval):
+            sp.valueChanged.connect(self._s(lambda _v: self._snap_timer.start(), "snap_timing_changed"))
+        self.lbl_snap = W.label("", "Dim", wrap=True)
+        c.add(self.lbl_snap)
+        self.btn_snap_now = W.button("今すぐ控える", "secondary", G.SAVE, on_click=self._s(self._snap_now, "snap_now"))
+        self.btn_snap_restore = W.button("抜く前の配置に戻す", "secondary", G.UNDO,
+                                         on_click=self._s(self._snap_restore, "snap_restore"))
+        c.add_layout(W.hbox(self.btn_snap_now, self.btn_snap_restore, None))
+        self.add(c)
+
+    # ================================================================ 新しいウィンドウの配置(L3)
+    def _build_place_card(self) -> None:
+        c = W.Card("新しいウィンドウの配置", "新しく開いたウィンドウが既定のプリセットの保存エントリに1対1で対応したときだけ、保存した位置へ1回だけ置きます。"
+                   "ウィンドウの一覧を一定間隔で見比べるだけで、フックは使いません。ゲーム・全画面が前面の間や一時停止中に開いた窓、"
+                   "管理者権限の窓は動かしません。", G.APP, self.accent)
+        cfg = self.mod.cfg
+        self.pill_place = W.StatusPill("オフ", "off")
+        c.add_header_widget(self.pill_place)
+        self.tg_place = W.ToggleSwitch(cfg.place_enabled, self.accent)
+        self.tg_place.toggled.connect(self._s(self._on_place_toggle, "place_on"))
+        c.add(W.SettingRow("新しいウィンドウを置く", "既定はオフ。オンにした時点で開いている窓は動かしません。", self.tg_place, G.APP))
+        self.seg_place = W.Segmented([("dry_run", "試運転"), ("live", "本番")], cfg.place_mode, self.accent)
+        self.seg_place.changed.connect(self._s(self._on_place_mode, "place_mode"))
+        c.add(W.SettingRow("動かし方", "試運転では「動かす予定」を下の表と操作履歴に出すだけです。本番でも、上のモードが試運転の間は動かしません。",
+                           None, G.EYE))
+        c.add(self.seg_place)
+        self.tbl_place = _table(["時刻", "判定", "exe", "クラス", "規則", "理由", "置く位置"], 5, height=150)
+        c.add(self.tbl_place)
+        self.add(c)
 
     # ================================================================ 計画
     def _build_plan_card(self) -> None:
@@ -273,7 +373,7 @@ class LayoutKeepPage(W.ScrollPage):
     def _build_layouts_card(self) -> None:
         c = W.Card("保存済みレイアウト", "構成(モニタの組み合わせ)ごとに1つ。選ぶとマップに表示します。適用できるのは現在の構成と一致するものだけです。",
                    G.LAYOUT, self.accent)
-        self.tbl_layouts = _table(["名前", "シグネチャ", "モニタ", "ウィンドウ", "保存日時", "状態"], 0, height=130)
+        self.tbl_layouts = _table(["名前", "シグネチャ", "プリセット", "モニタ", "ウィンドウ", "保存日時", "状態"], 0, height=130)
         self.tbl_layouts.itemSelectionChanged.connect(self._s(self._on_layout_select, "layout_select"))
         c.add(self.tbl_layouts)
         self.btn_l_plan = W.button("計画(試運転)", "secondary", G.EYE, on_click=self._s(self._plan, "l_plan"))
@@ -391,6 +491,7 @@ class LayoutKeepPage(W.ScrollPage):
             if sr and sr.reason:
                 self.pill_cfg.setToolTip(sr.reason)
         self.pill_prop.setVisible(bool(mod.proposal_sig and mod.proposal_sig == cur))
+        self.pill_snooze.setVisible(mod.snoozed())
         # 統計
         self._layouts = mod.store.list_layouts()
         self.st_mon.set_value(str(len(sr.monitors)) if sr else "—")
@@ -406,8 +507,11 @@ class LayoutKeepPage(W.ScrollPage):
         if self._shown_sig is not None and self._shown_sig not in {s.signature for s in self._layouts}:
             self._shown_sig = None
         self._fill_layouts(cur)
+        self._fill_presets(cur)
         self._fill_entries_and_map(cur, animate)
         self._fill_plan(cur)
+        self._fill_snapshot(cur)
+        self._fill_place()
         self._fill_targets()
         self._fill_ids(sr.monitors if sr else [])
         self._fill_history()
@@ -431,11 +535,16 @@ class LayoutKeepPage(W.ScrollPage):
                 first.setData(Qt.ItemDataRole.UserRole, s.signature)
                 t.setItem(r, 0, first)
                 t.setItem(r, 1, _item(s.signature, color=T.TEXT_DIM))
-                t.setItem(r, 2, _item("—" if s.broken else f"{s.monitor_count} 台"))
-                t.setItem(r, 3, _item("—" if s.broken else f"{s.window_count} 枚"))
-                t.setItem(r, 4, _item(_fmt_ts(s.saved_at) if s.saved_at else "—"))
+                if s.preset_count:
+                    ptext = f"{s.preset_count} 件(既定: {s.default_name})"
+                else:
+                    ptext = "自動保存のみ" if s.auto_slots else "—"
+                t.setItem(r, 2, _item(ptext, tip="v0.1 形式(次に保存したとき移行します)" if s.v1 else None))
+                t.setItem(r, 3, _item("—" if s.broken else f"{s.monitor_count} 台"))
+                t.setItem(r, 4, _item("—" if s.broken else f"{s.window_count} 枚"))
+                t.setItem(r, 5, _item(_fmt_ts(s.saved_at) if s.saved_at else "—"))
                 state = "壊れています" if s.broken else ("現在の構成" if is_cur else "別の構成")
-                t.setItem(r, 5, _item(state, color=T.DANGER if s.broken else (T.SUCCESS if is_cur else T.TEXT_MUTE)))
+                t.setItem(r, 6, _item(state, color=T.DANGER if s.broken else (T.SUCCESS if is_cur else T.TEXT_MUTE)))
                 if s.signature == keep:
                     sel_row = r
             if sel_row >= 0:
@@ -471,7 +580,10 @@ class LayoutKeepPage(W.ScrollPage):
         if not sig:
             return None, None
         try:
-            return self.mod.store.load_layout(sig), None
+            lay = self.mod.store.load_layout(sig, self._shown_preset)
+            if lay is None and self._shown_preset is None:
+                lay = self.mod.store.load_auto_slot(sig, "latest")  # プリセットが無い構成は自動保存を見せる
+            return lay, None
         except BrokenLayoutError as e:
             return None, str(e)
 
@@ -483,7 +595,8 @@ class LayoutKeepPage(W.ScrollPage):
         self.lbl_shown.set_state("info" if is_cur else "warn",
                                  "現在の構成" if is_cur else f"表示中: {self.mod.display_name(shown)}")
         self.btn_back.setVisible(not is_cur and cur is not None)
-        plan = self.mod.last_plan if (self.mod.last_plan and self.mod.last_plan.signature == shown) else None
+        plan = self.mod.last_plan if (self.mod.last_plan and self.mod.last_plan.signature == shown
+                                      and self.mod.last_plan_preset == self._shown_preset) else None
         plan_by = {i.index: i for i in plan.items} if plan else {}
         # モニタ
         mons: list[MapMonitor] = []
@@ -492,16 +605,16 @@ class LayoutKeepPage(W.ScrollPage):
             ordered = sorted(self.mod.last_sig.monitors, key=lambda m: (m.rect[0], m.rect[1]))
             for n, m in enumerate(ordered, 1):
                 mons.append(MapMonitor(m.ids.get(src) or m.device, m.rect, m.work, m.primary, m.dpi, n))
-            origin = primary_work_origin(self.mod.last_sig.monitors)
+            conv_mons: list[RawMonitor] = list(self.mod.last_sig.monitors)
         elif lay is not None:
             ordered_d = sorted(lay.monitors, key=lambda d: (int(d.get("x", 0)), int(d.get("y", 0))))
             for n, d in enumerate(ordered_d, 1):
                 x, y, w, h = (int(d.get(k, 0)) for k in ("x", "y", "w", "h"))
                 mons.append(MapMonitor(str(d.get("id") or n), (x, y, x + w, y + h), None, bool(d.get("primary")),
                                        int(d["dpi"]) if isinstance(d.get("dpi"), int) else None, n))
-            origin = (0, 0)
+            conv_mons = []
         else:
-            origin = (0, 0)
+            conv_mons = []
         boxes: list[MapBox] = []
         t = self.tbl_entries
         self._loading = True
@@ -523,8 +636,7 @@ class LayoutKeepPage(W.ScrollPage):
                     else:
                         color = T.SUCCESS if it.action == "move" else (T.WARN if it.key == "ambiguous" else T.TEXT_MUTE)
                         t.setItem(r, 6, _item("動かす" if it.action == "move" else "動かさない", color=color, tip=it.reason))
-                    rect = e.screen_rect or (e.normal_rect[0] + origin[0], e.normal_rect[1] + origin[1],
-                                             e.normal_rect[2] + origin[0], e.normal_rect[3] + origin[1])
+                    rect = e.screen_rect or (workspace_to_screen(e.normal_rect, conv_mons) if conv_mons else e.normal_rect)
                     boxes.append(MapBox(key=f"{shown}:{i}", index=i, rect=rect, label=e.exe_name.rsplit(".", 1)[0] or e.exe_name,
                                         maximized=e.show == "maximized",
                                         current=it.before_screen if it else None, moving=bool(it and it.action == "move"),
@@ -555,7 +667,9 @@ class LayoutKeepPage(W.ScrollPage):
         text = f"動かす {moves} 件 / 動かさない {sum(sk.values())} 件" + (f"({detail})" if detail else "")
         for exe, _cls, n in plan.ambiguous_groups():
             text += f"\n{exe.rsplit('.', 1)[0]} のウィンドウ {n} 枚は区別できないため動かしません。title_regex を書くと区別できます。"
-        self.lbl_plan.setText(text)
+        from .module import preset_label
+
+        self.lbl_plan.setText(f"{preset_label(self.mod.last_plan_preset)}の計画: " + text)
         for it in plan.items:
             r = t.rowCount()
             t.insertRow(r)
@@ -624,7 +738,9 @@ class LayoutKeepPage(W.ScrollPage):
             res = rec.get("result")
             label = ACTION_LABELS.get(action, action)
             if res and res not in ("applied",):
-                label += f"({res})"
+                label += f"({PRESET_RESULT_LABELS.get(str(res), res) if action == 'preset' else res})"
+            if rec.get("preset"):
+                label += f" 「{rec.get('preset')}」"
             color = {"apply": T.SUCCESS, "undo": T.INFO, "suppressed": T.WARN, "propose": self.accent}.get(action)
             if res in ("undo_failed", "sig_mismatch"):
                 color = T.DANGER
@@ -661,11 +777,12 @@ class LayoutKeepPage(W.ScrollPage):
             self._flash("試運転中は自動適用せず、提案通知だけ出します", "warn")
 
     def _save(self) -> None:
-        self.mod.save("gui")
         self._shown_sig = None
+        self._shown_preset = None
+        self.mod.save("gui")
 
     def _plan(self) -> None:
-        plan, text = self.mod.preview_plan()
+        plan, text = self.mod.preview_plan(self._shown_preset)
         if plan is None:
             W.message(self._parent(), "計画を作れません", text, kind="warn")
             return
@@ -675,7 +792,7 @@ class LayoutKeepPage(W.ScrollPage):
 
     def _apply(self) -> None:
         self._shown_sig = None
-        self.mod.apply_current("gui")
+        self.mod.apply_current("gui", preset=self._shown_preset)
 
     def _undo(self) -> None:
         ok, _ = W.confirm(self._parent(), "直前の適用を元に戻しますか?",
@@ -731,10 +848,13 @@ class LayoutKeepPage(W.ScrollPage):
         new_shown = None if sig == cur else sig
         if new_shown != self._shown_sig:
             self._shown_sig = new_shown
+            self._shown_preset = None
+            self._fill_presets(cur)
             self._fill_entries_and_map(cur, True)
 
     def _show_current(self) -> None:
         self._shown_sig = None
+        self._shown_preset = None
         self.refresh()
 
     def _on_map_hover(self, idx: int) -> None:
@@ -772,11 +892,12 @@ class LayoutKeepPage(W.ScrollPage):
         it = self.tbl_entries.item(row, col)
         text = it.text().strip() if it else ""
         sig = self._entries_layout.signature
+        preset = self._shown_preset
         # 編集確定のシグナル中に表を作り直さないよう、保存は次のイベントループで行う
-        QTimer.singleShot(0, self._s(lambda: self._save_entry_regex(sig, row, text), "entry_regex_save"))
+        QTimer.singleShot(0, self._s(lambda: self._save_entry_regex(sig, row, text, preset), "entry_regex_save"))
 
-    def _save_entry_regex(self, sig: str, row: int, text: str) -> None:
-        err = self.mod.set_entry_regex(sig, row, text or None)
+    def _save_entry_regex(self, sig: str, row: int, text: str, preset: str | None = None) -> None:
+        err = self.mod.set_entry_regex(sig, row, text or None, preset)
         if err:
             W.message(self._parent(), "title_regex を保存できません", err, kind="error")
             self.refresh(animate=False)
@@ -880,3 +1001,286 @@ class LayoutKeepPage(W.ScrollPage):
             s.setdefault("hotkeys", {})[name] = text
 
         self._settings_result(self.mod.update_settings(mut, restart=True), "ホットキーを保存しました(再起動します)")
+
+    # ================================================================ プリセット(表示と操作)
+    def _fill_presets(self, cur: str | None) -> None:
+        shown = self._shown(cur)
+        is_cur = shown is not None and shown == cur
+        ps: PresetSet | None = None
+        if shown:
+            try:
+                ps = self.mod.store.load_set(shown)
+            except BrokenLayoutError:
+                ps = None
+        self._preset_set = ps
+        auto = self.mod.store.load_auto_quiet(shown) if shown else None
+        valid = {p.name for p in ps.presets} if ps else set()
+        valid |= {name for name, key in AUTO_SLOT_KEYS.items() if auto is not None and key in auto.slots}
+        if self._shown_preset is not None and self._shown_preset not in valid:
+            self._shown_preset = None
+        t = self.tbl_presets
+        self._loading = True
+        try:
+            t.setRowCount(0)
+            sel = -1
+            d = ps.default() if ps else None
+            rows: list[tuple[str | None, str, bool, int, str, str]] = []
+            if ps is not None:
+                for p in sorted(ps.presets, key=lambda x: x is not d):
+                    rows.append((p.name, p.name, p is d, len(p.windows), p.saved_at, "保存したプリセット"))
+            for name, key in AUTO_SLOT_KEYS.items():
+                lay = auto.slots.get(key) if auto is not None else None
+                if lay is not None:
+                    label = "自動: 抜く前" if name == AUTO_BEFORE else "自動: 最新"
+                    rows.append((name, label, False, len(lay.windows), lay.saved_at, "自動スナップショット"))
+            for key_name, label, is_default, n, saved_at, kind in rows:
+                r = t.rowCount()
+                t.insertRow(r)
+                first = _item(("★  " if is_default else "") + label, bold=is_default,
+                              color=self.accent if is_default else (T.TEXT_DIM if kind != "保存したプリセット" else None))
+                first.setData(Qt.ItemDataRole.UserRole, key_name)
+                t.setItem(r, 0, first)
+                t.setItem(r, 1, _item("既定" if is_default else "", color=self.accent))
+                t.setItem(r, 2, _item(f"{n} 枚"))
+                t.setItem(r, 3, _item(_fmt_ts(saved_at) if saved_at else "—", color=T.TEXT_DIM))
+                t.setItem(r, 4, _item(kind, color=T.TEXT_MUTE))
+                want = self._shown_preset if self._shown_preset is not None else (d.name if d else None)
+                if key_name == want:
+                    sel = r
+            if sel >= 0:
+                t.selectRow(sel)
+        finally:
+            self._loading = False
+        from .module import preset_label
+
+        self.pill_preset.set_state("info" if self._shown_preset is None else "accent",
+                                   "既定" if self._shown_preset is None else preset_label(self._shown_preset))
+        self._update_preset_buttons(is_cur)
+
+    def _selected_preset(self) -> str | None:
+        r = self.tbl_presets.currentRow()
+        it = self.tbl_presets.item(r, 0) if r >= 0 else None
+        if it is None:
+            return None
+        v = it.data(Qt.ItemDataRole.UserRole)
+        return str(v) if v else None
+
+    def _update_preset_buttons(self, is_cur: bool) -> None:
+        disabled = bool(self.mod.disabled_reason)
+        sel = self._selected_preset()
+        user = sel is not None and sel not in AUTO_SLOT_KEYS
+        self.btn_p_saveas.setEnabled(is_cur and not disabled)
+        self.btn_p_overwrite.setEnabled(is_cur and user and not disabled)
+        self.btn_p_plan.setEnabled(is_cur and sel is not None and not disabled)
+        self.btn_p_apply.setEnabled(is_cur and sel is not None and not disabled)
+        self.btn_p_apply.setText("適用" if self.mod.cfg.live else "適用(試運転)")
+        d = self._preset_set.default() if self._preset_set else None
+        self.btn_p_default.setEnabled(user and not (d is not None and d.name == sel))
+        self.btn_p_rename.setEnabled(user)
+        self.btn_p_delete.setEnabled(user)
+        if not is_cur and self._shown_sig is not None:
+            self.lbl_p_hint.setText("表示中の構成は今のモニタ構成と一致しないため、保存・適用はできません(名前の変更・既定・削除はできます)。")
+        elif self._preset_set is None:
+            self.lbl_p_hint.setText("この構成のプリセットはまだありません。「名前を付けて保存」か「現在の配置を既定に保存」で作れます。")
+        else:
+            self.lbl_p_hint.setText("")
+
+    def _on_preset_select(self) -> None:
+        if self._loading:
+            return
+        sel = self._selected_preset()
+        d = self._preset_set.default() if self._preset_set else None
+        new = None if (sel is None or (d is not None and sel == d.name)) else sel
+        cur = self.mod.last_sig.signature if self.mod.last_sig else None
+        if new != self._shown_preset:
+            self._shown_preset = new
+            from .module import preset_label
+
+            self.pill_preset.set_state("info" if new is None else "accent", "既定" if new is None else preset_label(new))
+            self._fill_entries_and_map(cur, True)
+        self._update_preset_buttons(self._shown(cur) == cur)
+
+    def _preset_id(self, name: str | None) -> str | None:
+        p = self._preset_set.by_name(name) if (self._preset_set and name) else None
+        return p.id if p else None
+
+    def _preset_save_as(self) -> None:
+        v = W.text_input(self._parent(), "名前を付けて保存", "今の対象ウィンドウの配置を、この構成のプリセットとして保存します(例: 作業用・配信用)。", "")
+        if v is None:
+            return
+        v = v.strip()
+        err = validate_preset_name(v)
+        if err:
+            W.message(self._parent(), "保存できません", err, kind="warn")
+            return
+        if self._preset_set is not None and self._preset_set.by_name(v) is not None:
+            ok, _ = W.confirm(self._parent(), "上書きしますか?", f"プリセット「{v}」は既にあります。今の配置で上書きします"
+                              "(上書き前の内容は .prev.json に1世代残ります)。", ok_text="上書き")
+            if not ok:
+                return
+        if self.mod.save("gui", v):
+            self._shown_preset = v
+            self.refresh()
+            self._flash("プリセットを保存しました")
+
+    def _preset_overwrite(self) -> None:
+        sel = self._selected_preset()
+        if not sel or sel in AUTO_SLOT_KEYS:
+            return
+        ok, _ = W.confirm(self._parent(), "上書き保存しますか?", f"プリセット「{sel}」を今の配置で上書きします"
+                          "(上書き前の内容は .prev.json に1世代残ります)。", ok_text="上書き")
+        if ok and self.mod.save("gui", sel):
+            self._flash("上書き保存しました")
+
+    def _preset_plan(self) -> None:
+        sel = self._selected_preset()
+        d = self._preset_set.default() if self._preset_set else None
+        self._shown_preset = None if (d is not None and sel == d.name) else sel
+        plan, text = self.mod.preview_plan(self._shown_preset)
+        if plan is None:
+            W.message(self._parent(), "計画を作れません", text, kind="warn")
+            return
+        self.refresh()
+        self._flash("計画を作りました", "info")
+
+    def _preset_apply(self) -> None:
+        sel = self._selected_preset()
+        if not sel:
+            return
+        d = self._preset_set.default() if self._preset_set else None
+        self._shown_preset = None if (d is not None and sel == d.name) else sel
+        self.mod.apply_current("gui", preset=sel)
+
+    def _preset_default(self) -> None:
+        pid = self._preset_id(self._selected_preset())
+        sig = self._preset_set.signature if self._preset_set else None
+        if pid and sig:
+            self._shown_preset = None
+            self._settings_result(self.mod.set_default_preset(sig, pid), "既定にしました")
+
+    def _preset_rename(self) -> None:
+        sel = self._selected_preset()
+        pid = self._preset_id(sel)
+        sig = self._preset_set.signature if self._preset_set else None
+        if not pid or not sig or sel is None:
+            return
+        v = W.text_input(self._parent(), "プリセットの名前を変更", "layout.apply の preset でもこの名前で指定できます。", sel)
+        if v is None:
+            return
+        err = self.mod.rename_preset(sig, pid, v)
+        if not err and self._shown_preset == sel:
+            self._shown_preset = v.strip()
+        self._settings_result(err, "名前を変更しました")
+
+    def _preset_delete(self) -> None:
+        sel = self._selected_preset()
+        pid = self._preset_id(sel)
+        sig = self._preset_set.signature if self._preset_set else None
+        if not pid or not sig:
+            return
+        ok, _ = W.confirm(self._parent(), "プリセットを削除しますか?",
+                          f"プリセット「{sel}」を一覧から外します。DeskKit 自身のデータなので、ファイルは消さずに "
+                          f"{sig}.{pid}.json.deleted-<日時> として残します。", ok_text="削除", danger=True)
+        if not ok:
+            return
+        err = self.mod.delete_preset(sig, pid)
+        if err:
+            W.message(self._parent(), "削除できません", err, kind="error")
+            return
+        self._shown_preset = None
+        self._flash("削除しました")
+        self.refresh()
+
+    # ================================================================ 自動スナップショット(表示と操作)
+    def _fill_snapshot(self, cur: str | None) -> None:
+        cfg = self.mod.cfg
+        self.tg_snap.set_checked_silent(cfg.snapshot_enabled)
+        for sp, v in ((self.sp_snap_stable, cfg.snapshot_stable_min), (self.sp_snap_interval, cfg.snapshot_interval_min)):
+            if sp.value() != v and not self._snap_timer.isActive():
+                sp.blockSignals(True)
+                sp.setValue(v)
+                sp.blockSignals(False)
+        auto = self.mod.store.load_auto_quiet(cur) if cur else None
+        parts: list[str] = []
+        if auto is not None:
+            for key, label in (("latest", "最新"), ("before_change", "抜く前")):
+                lay = auto.slots.get(key)
+                if lay is not None:
+                    parts.append(f"{label}: {_fmt_ts(lay.saved_at)}({len(lay.windows)} 枚)")
+        text = " / ".join(parts) if parts else "この構成の自動保存はまだありません。"
+        code = self.mod.codes.get("snapshot")
+        if code:
+            text += f"  —  直近の結果: {SNAP_CODE_LABELS.get(code, code)}"
+        self.lbl_snap.setText(text)
+        disabled = bool(self.mod.disabled_reason)
+        self.btn_snap_now.setEnabled(not disabled)
+        self.btn_snap_restore.setEnabled(not disabled and self.mod.auto_restore_name(cur) is not None)
+        self.btn_snap_restore.setText("抜く前の配置に戻す" if self.mod.cfg.live else "抜く前の配置に戻す(試運転)")
+
+    def _set_nested(self, section: str, key: str, value: Any) -> None:
+        self._settings_result(self.mod.set_nested(section, key, value))
+
+    def _save_snap_timing(self) -> None:
+        a, b = self.sp_snap_stable.value(), self.sp_snap_interval.value()
+
+        def mut(s: dict[str, Any]) -> None:
+            d = s.setdefault("auto_snapshot", {})
+            d["stable_min"], d["interval_min"] = a, b
+
+        self._settings_result(self.mod.update_settings(mut))
+
+    def _snap_now(self) -> None:
+        code = self.mod.snapshot_now("gui")
+        self._flash(SNAP_CODE_LABELS.get(code, code), "ok" if code in ("saved", "unchanged") else "warn")
+        self.refresh()
+
+    def _snap_restore(self) -> None:
+        self._shown_sig = None
+        self.mod.restore_auto("gui")
+
+    # ================================================================ 新しいウィンドウの配置(表示と操作)
+    def _fill_place(self) -> None:
+        cfg = self.mod.cfg
+        self.tg_place.set_checked_silent(cfg.place_enabled)
+        self.seg_place.set_value(cfg.place_mode, animate=False)
+        if not cfg.place_enabled:
+            self.pill_place.set_state("off", "オフ")
+        elif cfg.place_live:
+            self.pill_place.set_state("ok", "本番")
+        else:
+            self.pill_place.set_state("warn", "試運転")
+        t = self.tbl_place
+        t.setRowCount(0)
+        for ev in self.mod.place_events:
+            r = t.rowCount()
+            t.insertRow(r)
+            color = {"moved": T.SUCCESS, "would_move": self.accent}.get(ev.action, T.TEXT_MUTE)
+            t.setItem(r, 0, _item(_fmt_ts(ev.ts), color=T.TEXT_DIM))
+            t.setItem(r, 1, _item(PLACE_ACTION_LABELS.get(ev.action, ev.action), color=color, bold=True))
+            t.setItem(r, 2, _item(ev.exe_name))
+            t.setItem(r, 3, _item(ev.cls, color=T.TEXT_DIM))
+            t.setItem(r, 4, _item(ev.rule or "—", color=T.TEXT_DIM))
+            t.setItem(r, 5, _item(PLACE_KEY_LABELS.get(ev.key, _skip_label(ev.key))))
+            t.setItem(r, 6, _item(rect_text(ev.after) if ev.after else "—", color=T.TEXT_DIM))
+
+    def _on_place_toggle(self, on: bool) -> None:
+        self._set_nested("place_new", "enabled", bool(on))
+        if on and not self.mod.cfg.place_live:
+            self._flash("試運転: 動かす予定を表に出すだけです", "warn")
+
+    def _on_place_mode(self, mode: str) -> None:
+        if mode == "live":
+            ok, _ = W.confirm(self._parent(), "新しいウィンドウを本番で置きますか?",
+                              "新しく開いたウィンドウが既定のプリセットに1対1で対応したとき、SetWindowPlacement で1回だけ保存位置へ置きます。"
+                              "動かす前の配置は undo.json に残り、「直前の適用を元に戻す」で戻せます。上のモードが試運転の間は動かしません。",
+                              ok_text="本番にする", glyph=G.WARNING)
+            if not ok:
+                self.seg_place.set_value("dry_run")
+                return
+        self._set_nested("place_new", "mode", mode)
+
+
+SNAP_CODE_LABELS = {"saved": "控えました", "unchanged": "前回と同じ配置(書き込みなし)", "no_windows": "対象のウィンドウがありません",
+                    "snoozed": "一時停止中", "game": "ゲームが前面", "fullscreen": "全画面が前面",
+                    "fullscreen_unknown": "全画面か判定できない", "no_signature": "構成を計算できない",
+                    "sig_changed": "構成が変わった直後", "write_failed": "書き込めませんでした", "disabled": "無効"}

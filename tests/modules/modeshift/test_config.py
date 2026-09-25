@@ -55,6 +55,12 @@ def test_other_validation_rules(tmp_path: Path) -> None:
     assert not normalize_action({"type": "open_url", "url": "https://example.com/a?b=c"}, fs_games)[1]
     assert normalize_action({"type": "open_url", "url": "javascript:alert(1)"}, fs_games)[1]
     assert safe_url("https://example.com/a?token=x#f") == "https://example.com/a?…"
+    from deskkit.modules.modeshift.config import url_host
+
+    assert url_host("https://Example.COM/a/b?token=x#f") == "example.com"
+    assert url_host("http://user:pw@Host.example.org:8080/p") == "host.example.org"
+    assert url_host("https://[::1]:8443/x") == "[::1]"
+    assert url_host("ftp://example.com/") == "(解釈できない URL)"
 
 
 def test_duplicate_hotkey_disables_later_only(tmp_path: Path) -> None:

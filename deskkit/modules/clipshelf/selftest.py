@@ -1,4 +1,4 @@
-# 自己検査(FR-23)。偽 Win32Api で policy・monitor・writer・保持上限・定型文展開を通し、
+# 自己検査(FR-23)。偽 Win32Api で policy・monitor・writer・保持上限・定型文展開(v0.2 の入力欄・変換・短命記録も)を通し、
 # 実 DPAPI で目印文字列を一時フォルダの DB に暗号化保存した後、DB・ログ・ops.jsonl のバイト列(UTF-8 / UTF-16LE)に
 # 目印が無いことを確かめる。実機のクリップボード・%LOCALAPPDATA%\DeskKit には触れない。run() は 0=合格 / 1=不合格。
 from __future__ import annotations
@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from deskkit.modules.clipshelf import config as cfgmod
-from deskkit.modules.clipshelf import policy, snippets
+from deskkit.modules.clipshelf import policy, snippets, transforms
 from deskkit.modules.clipshelf._win32 import (
     FMT_CAN_INCLUDE_HISTORY,
     FMT_CAN_UPLOAD_CLOUD,
@@ -134,6 +134,37 @@ def _fake_checks(r: _Result) -> None:
     clock2 = FakeClock()
     exp = snippets.expand("{date} {time} {clipboard} {{x}} {unknown}", clock2(), "CLIP")
     r.check("定型文の展開", exp.text == "2026-10-01 10:00 CLIP {x} {unknown}" and exp.unknown == ["unknown"])
+    tpl = "{input:宛名=山田}様 {select:至急|通常} {input:宛名}"
+    got = snippets.expand(tpl, clock2(), None, values={"input:宛名": "佐藤{date}"}).text
+    r.check("定型文の入力欄・選択欄(値は1回だけ置換、無い欄は既定値)",
+            got == "佐藤{date}様 至急 佐藤{date}" and [f.label for f in snippets.fields(tpl)] == ["宛名", "選択 1"])
+    r.check("変換して貼り付けの変換", [transforms.apply(t, " Ａb\n c ") for t in transforms.IDS]
+            == ["Ａb\n c", " Ａb c ", " Ab\n c ", " ＡB\n C ", " ａb\n c ", " Ａb"])
+    _v02_store_checks(r)
+
+
+def _v02_store_checks(r: _Result) -> None:
+    """短命記録(C3)の期限切れ削除と、全消去が復号できない履歴の行も消すこと。"""
+    with tempfile.TemporaryDirectory(prefix="clipshelf-selftest-") as td:
+        tmp = Path(td)
+        api, mon, store, ops, clock, _cfg = _env(tmp, FakeCipher(), short_lived={"exes": ["vault.exe"], "minutes": 5})
+        api.put("短命", owner_exe="C:\\x\\vault.exe")
+        short = mon.process()
+        api.put("普通")
+        normal = mon.process()
+        clock.advance(minutes=5)
+        n = store.expire()
+        r.check("短命記録は期限で消え、他は残る",
+                n == 1 and short is not None and store.get(short.item_id or 0) is None
+                and normal is not None and store.get(normal.item_id or 0) is not None)
+        store._db().execute("INSERT INTO items (kind, created_at, last_used_at, pinned, payload) VALUES "
+                            "('history', '2026-01-01T00:00:00+09:00', '2026-01-01T00:00:00+09:00', 1, x'00')")
+        store.close()
+        store.open()
+        cleared = store.clear_all(include_pins=False)
+        r.check("全消去で復号できない履歴の行も消える", cleared == 2 and store.undecryptable == 0 and store.row_count() == 0)
+        store.close()
+        _close_logs()
 
 
 def _dpapi_canary(r: _Result) -> None:

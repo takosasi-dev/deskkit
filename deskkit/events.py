@@ -8,7 +8,12 @@ from typing import Any
 
 log = logging.getLogger("deskkit.host.events")
 
-REGISTERED_EVENTS: frozenset[str] = frozenset({"layout.apply", "layout.applied", "modeshift.switched"})
+REGISTERED_EVENTS: frozenset[str] = frozenset({
+    "layout.apply", "layout.applied", "modeshift.switched",
+    # v0.2(docs/INTERFACES_v0.2.md §2)
+    "modeshift.reverted",   # ModeShift → {"mode": str, "run_id": str}(戻す前のモード名)
+    "host.snooze_changed",  # 本体 → {"snoozed": bool, "until": str | None}(ISO 8601、無期限・QUNS 連動は None)
+})
 Handler = Callable[[Mapping[str, Any]], None]
 
 

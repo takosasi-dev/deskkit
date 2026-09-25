@@ -1,5 +1,5 @@
 # 操作ログ ops.jsonl(1 Step 1行、追記のみ。C-8 / INV-11)。書き換え・削除はしない。
-# 対象は Step.target(URL はクエリを落とした表記)だけを書き、ウィンドウタイトルは扱わない。
+# 対象は Step.target を書く。ただし open_url はホスト名だけ(利用者の判断 v0.2: ドメインのみ)。ウィンドウタイトルは扱わない。
 # 画面の履歴表示用に末尾の数行を読む関数も持つ。
 from __future__ import annotations
 
@@ -9,9 +9,17 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from deskkit.modules.modeshift.config import url_host
 from deskkit.modules.modeshift.model import Plan, Step, now_iso
 
 log = logging.getLogger("deskkit.modeshift")
+
+
+def log_target(step: Step) -> str:
+    """ops.jsonl に書く対象。open_url は URL のホスト名だけ(パス・クエリを残さない)。"""
+    if step.type == "open_url":
+        return url_host(str(step.params.get("url") or ""))
+    return step.target
 
 
 def make_row(plan: Plan, step: Step, result: str, reason: str) -> dict[str, Any]:
@@ -23,7 +31,7 @@ def make_row(plan: Plan, step: Step, result: str, reason: str) -> dict[str, Any]
         "dry_run": plan.dry_run,
         "step": step.index,
         "type": step.type,
-        "target": step.target,
+        "target": log_target(step),
         "result": result,
         "reason": reason,
     }

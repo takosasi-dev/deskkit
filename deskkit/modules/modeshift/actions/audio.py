@@ -1,6 +1,6 @@
-# master_volume / app_volume: Core Audio の公開 COM インタフェースを ctypes の vtable 経由で直接呼ぶ(D-8。追加ライブラリなし)。
-# 呼び出したスレッドで CoInitializeEx し、取得したインタフェースはすべて Release する。設定直後に読み戻した値を
-# snapshot の「書いた値」に記録する(FR-15 / FR-16)。セッションが無いアプリは skipped。
+# master_volume / app_volume / mic_volume: Core Audio の公開 COM インタフェースを ctypes の vtable 経由で直接呼ぶ(D-8。
+# 追加ライブラリなし)。呼び出したスレッドで CoInitializeEx し、取得したインタフェースはすべて Release する。設定直後に
+# 読み戻した値を snapshot の「書いた値」に記録する(FR-15 / FR-16)。マイクは既定の録音デバイスの IAudioEndpointVolume。
 from __future__ import annotations
 
 import ctypes
@@ -73,6 +73,7 @@ IID_ISimpleAudioVolume = "87CE5498-68D6-44E5-9215-6DA47EF883D8"
 CLSCTX_ALL = 0x17            # INPROC_SERVER | INPROC_HANDLER | LOCAL_SERVER | REMOTE_SERVER
 COINIT_MULTITHREADED = 0x0
 E_RENDER = 0                 # EDataFlow.eRender
+E_CAPTURE = 1                # EDataFlow.eCapture(マイク)
 E_MULTIMEDIA = 1             # ERole.eMultimedia
 S_OK = 0
 RPC_E_CHANGED_MODE = -2147417850    # 0x80010106
@@ -165,11 +166,11 @@ def _enumerator() -> int:
     return int(out.value or 0)
 
 
-def _default_device(enum: int) -> int | None:
+def _default_device(enum: int, flow: int = E_RENDER) -> int | None:
     out = ctypes.c_void_p()
     try:
         _call(enum, IDX_ENUM_GET_DEFAULT, [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)],
-              E_RENDER, E_MULTIMEDIA, ctypes.byref(out), what="GetDefaultAudioEndpoint")
+              flow, E_MULTIMEDIA, ctypes.byref(out), what="GetDefaultAudioEndpoint")
     except ComError as e:
         if e.hr == E_NOTFOUND:
             return None
@@ -207,9 +208,9 @@ def _epv_read(epv: int) -> tuple[float, bool]:
 class CoreAudio:
     """AudioApi の実物。メソッドごとに COM を初期化し、使ったインタフェースを全部 Release する。"""
 
-    def _with_endpoint(self, fn: Callable[[int, str | None], Any]) -> Any:
+    def _with_endpoint(self, fn: Callable[[int, str | None], Any], flow: int = E_RENDER) -> Any:
         with com_scope(), _ref(_enumerator()) as enum:
-            dev = _default_device(enum)
+            dev = _default_device(enum, flow)
             if dev is None:
                 return None
             with _ref(dev):
@@ -218,13 +219,26 @@ class CoreAudio:
                     return fn(epv, dev_id)
 
     def get_master(self) -> MasterState | None:
+        return self._get_endpoint(E_RENDER)
+
+    def set_master(self, level: float | None, mute: bool | None) -> MasterState | None:
+        return self._set_endpoint(E_RENDER, level, mute)
+
+    def get_capture(self) -> MasterState | None:
+        """既定の録音デバイス(マイク)の音量とミュート。デバイスが無ければ None。"""
+        return self._get_endpoint(E_CAPTURE)
+
+    def set_capture(self, level: float | None, mute: bool | None) -> MasterState | None:
+        return self._set_endpoint(E_CAPTURE, level, mute)
+
+    def _get_endpoint(self, flow: int) -> MasterState | None:
         def read(epv: int, dev_id: str | None) -> MasterState:
             lv, mute = _epv_read(epv)
             return MasterState(lv, mute, dev_id)
 
-        return self._with_endpoint(read)  # type: ignore[no-any-return]
+        return self._with_endpoint(read, flow)  # type: ignore[no-any-return]
 
-    def set_master(self, level: float | None, mute: bool | None) -> MasterState | None:
+    def _set_endpoint(self, flow: int, level: float | None, mute: bool | None) -> MasterState | None:
         def write(epv: int, dev_id: str | None) -> MasterState:
             if level is not None:
                 v = max(0.0, min(1.0, float(level)))
@@ -235,7 +249,7 @@ class CoreAudio:
             lv, mu = _epv_read(epv)   # 設定直後に読み戻す(FR-15)
             return MasterState(lv, mu, dev_id)
 
-        return self._with_endpoint(write)  # type: ignore[no-any-return]
+        return self._with_endpoint(write, flow)  # type: ignore[no-any-return]
 
     def _each_session(self, fn: Callable[[str, int, int], None]) -> None:
         """既定の再生デバイスの各セッションについて fn(instance_id, pid, ISimpleAudioVolume*) を呼ぶ。"""
@@ -397,3 +411,35 @@ def run_app(step: Step, env: ExecEnv) -> tuple[str, str]:
     if len(bad) == len(targets):
         return FAILED, "音量を設定できない"
     return OK, f"{len(targets) - len(bad)} セッションを {pct(level)} に"
+
+
+# ------------------------------------------------------------------ マイク(mic_volume。v0.2)
+def mic_text(level: float | None, mute: bool | None) -> str:
+    return _master_text(level, mute)
+
+
+def plan_mic(a: dict[str, Any], env: PlanEnv) -> Step:
+    level, mute = a.get("level"), a.get("mute")
+    m = env.capture()
+    cur = f"{pct(m.level)}・{'ミュート中' if m.mute else 'ミュートなし'}" if m else "読めない"
+    step = Step(0, "mic_volume", "マイク", cur, mic_text(level, mute), True, params={"level": level, "mute": mute})
+    if m is None:
+        step.planned, step.reason = False, "既定の録音デバイスが無い/読めない"
+    elif (level is None or _same_level(m.level, level)) and (mute is None or m.mute == mute):
+        step.planned, step.reason = False, "既に同じ値"
+    return step
+
+
+def run_mic(step: Step, env: ExecEnv) -> tuple[str, str]:
+    level, mute = step.params.get("level"), step.params.get("mute")
+    cur = env.backends.audio.get_capture()
+    if cur is None:
+        return FAILED, "既定の録音デバイスを読めない"
+    if (level is None or _same_level(cur.level, level)) and (mute is None or cur.mute == mute):
+        return SKIPPED, "既に同じ値"
+    rb = env.backends.audio.set_capture(level, mute)
+    if rb is None:
+        return FAILED, "設定できない(録音デバイスが無い)"
+    if env.snapshot is not None and env.snapshot.get("mic") is not None:
+        env.snapshot["mic"]["written"] = {"level": rb.level, "mute": rb.mute}
+    return OK, f"読み戻し {pct(rb.level)}" + ("・ミュート" if rb.mute else "")

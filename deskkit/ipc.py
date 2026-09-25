@@ -7,6 +7,7 @@ import getpass
 import hashlib
 import json
 import logging
+import time
 from collections.abc import Callable
 
 from PySide6.QtCore import QObject
@@ -30,16 +31,33 @@ def server_name() -> str:
 _mutex_handle: int | None = None
 
 
-def acquire_instance_mutex() -> bool:
+def acquire_instance_mutex(name: str | None = None) -> bool:
     """同一ユーザーで既に起動していれば False。"""
     global _mutex_handle
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
     k32.CreateMutexW.restype = ctypes.c_void_p
-    h = k32.CreateMutexW(None, False, "Local\\" + server_name())
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    k32.CloseHandle.restype = ctypes.c_int
+    h = k32.CreateMutexW(None, False, "Local\\" + (name or server_name()))
     already = ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+    if h and already:
+        # 相手のミューテックスへのハンドルを持ち続けると、相手が終わっても消えなくなる(再試行が永久に失敗する)
+        k32.CloseHandle(h)
+        return False
     _mutex_handle = h
-    return bool(h) and not already
+    return bool(h)
+
+
+def wait_instance_mutex(timeout_s: float, interval_s: float = 0.5, name: str | None = None) -> bool:
+    """更新・再起動の直後用: 旧プロセスが終わってミューテックスが空くまで待って取る。取れなければ False。"""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if acquire_instance_mutex(name):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval_s)
 
 
 class IpcServer(QObject):

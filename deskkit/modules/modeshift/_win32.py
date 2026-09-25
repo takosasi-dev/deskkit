@@ -1,5 +1,5 @@
 # ModeShift が使う Win32(ctypes): プロセス一覧(Toolhelp。exe 名と PID のみ。INV-12)、可視トップレベル
-# ウィンドウへの WM_CLOSE、終了待ち、FR-14 の確認済み強制終了(この1関数だけ)。argtypes/restype は必ず設定する。
+# ウィンドウへの WM_CLOSE、終了待ち、FR-14 の確認済み強制終了(確認前に開いたハンドル経由の1関数だけ)。argtypes/restype は必ず設定する。
 # host 内部の Win32 定義は import しない(自前の WinDLL インスタンスを使う)。
 from __future__ import annotations
 
@@ -39,6 +39,13 @@ class PROCESSENTRY32W(ctypes.Structure):
     ]
 
 
+class SYSTEM_POWER_STATUS(ctypes.Structure):  # noqa: N801 - winbase.h の名前のまま
+    _fields_ = [
+        ("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte), ("BatteryLifePercent", ctypes.c_ubyte),
+        ("SystemStatusFlag", ctypes.c_ubyte), ("BatteryLifeTime", w.DWORD), ("BatteryFullLifeTime", w.DWORD),
+    ]
+
+
 WNDENUMPROC = ctypes.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
 
 _k32.CreateToolhelp32Snapshot.argtypes = [w.DWORD, w.DWORD]
@@ -57,6 +64,8 @@ _k32.GetExitCodeProcess.argtypes = [w.HANDLE, ctypes.POINTER(w.DWORD)]
 _k32.GetExitCodeProcess.restype = w.BOOL
 _k32.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
 _k32.WaitForSingleObject.restype = w.DWORD
+_k32.GetSystemPowerStatus.argtypes = [ctypes.POINTER(SYSTEM_POWER_STATUS)]
+_k32.GetSystemPowerStatus.restype = w.BOOL
 
 _u32.EnumWindows.argtypes = [WNDENUMPROC, w.LPARAM]
 _u32.EnumWindows.restype = w.BOOL
@@ -86,6 +95,18 @@ def list_processes() -> list[ProcInfo]:
     finally:
         _k32.CloseHandle(snap)
     return out
+
+
+def ac_line_status() -> bool | None:
+    """AC 電源につながっていれば True、バッテリー駆動なら False、不明(255)・読めなければ None。"""
+    st = SYSTEM_POWER_STATUS()
+    if not _k32.GetSystemPowerStatus(ctypes.byref(st)):
+        return None
+    if st.ACLineStatus == 1:
+        return True
+    if st.ACLineStatus == 0:
+        return False
+    return None
 
 
 def exe_path(pid: int) -> str | None:
@@ -176,20 +197,56 @@ def wait_exit(pids: set[int], timeout_s: float, abort: threading.Event) -> set[i
             _k32.CloseHandle(h)
 
 
-def force_terminate_confirmed(pid: int) -> tuple[bool, str]:
-    """FR-14: 確認ダイアログで利用者が承認した後にだけ呼ぶ強制終了。この関数以外から強制終了しない(INV-1)。"""
-    fn = _k32.TerminateProcess
-    fn.argtypes = [w.HANDLE, w.UINT]
-    fn.restype = w.BOOL
-    h = _k32.OpenProcess(PROCESS_TERMINATE_RIGHT, False, pid)
-    if not h:
-        return False, f"プロセスを開けません(Win32 エラー {ctypes.get_last_error()})"
-    try:
-        if fn(h, 1):
+class ForceHandle:
+    """FR-14 の強制終了の候補(ForceTarget の実物)。確認ダイアログを出す前に
+    PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION で開き、承認後はこの同じハンドルで終了させる。
+    ハンドルを持っている間はプロセスオブジェクトが残るため、待っている間に対象が終了しても PID は再利用されない。"""
+
+    def __init__(self, pid: int, handle: int) -> None:
+        self.pid = pid
+        self._h: int | None = handle
+
+    def alive(self) -> bool:
+        if not self._h:
+            return False
+        return bool(_k32.WaitForSingleObject(self._h, 0) == WAIT_TIMEOUT)
+
+    def terminate_confirmed(self) -> tuple[bool, str]:
+        """確認ダイアログで利用者が承認した後にだけ呼ぶ強制終了。この関数以外から強制終了しない(INV-1)。"""
+        if not self._h:
+            return False, "ハンドルが閉じられている"
+        if not self.alive():
+            return False, "既に終了していた"
+        fn = _k32.TerminateProcess
+        fn.argtypes = [w.HANDLE, w.UINT]
+        fn.restype = w.BOOL
+        if fn(self._h, 1):
             return True, "確認のうえ強制終了しました"
         return False, f"強制終了に失敗(Win32 エラー {ctypes.get_last_error()})"
-    finally:
-        _k32.CloseHandle(h)
+
+    def close(self) -> None:
+        h, self._h = self._h, None
+        if h:
+            _k32.CloseHandle(h)
+
+
+def open_for_force(pid: int, exe: str) -> ForceHandle | None:
+    """強制終了の候補としてハンドルを開く。開けない(昇格プロセス等)・既に別の exe になっている → None。"""
+    h = _k32.OpenProcess(PROCESS_TERMINATE_RIGHT | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return None
+    fh = ForceHandle(pid, h)
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        n = w.DWORD(len(buf))
+        ok = _k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n))
+        if not ok or exe_basename(buf.value) != exe.lower() or not fh.alive():
+            fh.close()
+            return None
+    except BaseException:
+        fh.close()
+        raise
+    return fh
 
 
 class Win32Processes:
@@ -213,8 +270,8 @@ class Win32Processes:
     def wait_exit(self, pids: set[int], timeout_s: float, abort: threading.Event) -> set[int]:
         return wait_exit(pids, timeout_s, abort)
 
-    def force_terminate_confirmed(self, pid: int) -> tuple[bool, str]:
-        return force_terminate_confirmed(pid)
+    def open_for_force(self, pid: int, exe: str) -> ForceHandle | None:
+        return open_for_force(pid, exe)
 
 
 def exe_basename(path: str) -> str:

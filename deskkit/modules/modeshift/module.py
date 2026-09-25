@@ -8,7 +8,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from deskkit.modules.modeshift import cli
-from deskkit.modules.modeshift.autoswitch import AutoSwitcher
+from deskkit.modules.modeshift.autoswitch import WM_POWERBROADCAST, AutoSwitcher, PowerSourceWatcher
 from deskkit.modules.modeshift.config import AutoRule, fill_defaults
 from deskkit.modules.modeshift.model import Plan, Step
 from deskkit.modules.modeshift.service import ModeShiftService
@@ -36,6 +36,7 @@ class ModeShiftModule:
         self._undo_item: Any = None
         self._hotkeys: list[str] = []
         self._auto: AutoSwitcher | None = None
+        self._power_watch: PowerSourceWatcher | None = None
         self._preview: Any = None
         self._picker: Any = None
 
@@ -43,17 +44,41 @@ class ModeShiftModule:
     def start(self) -> None:
         self.service = ModeShiftService(self.ctx, self._backends or real_backends(), ui=self)
         self.service.add_listener(self._refresh_tray)
+        # 電源のきっかけ(v0.2)。購読は1回だけにし、ルールの有無は受けたときの設定で判断する(購読は host が停止時に片付ける)
+        self.ctx.on_native(WM_POWERBROADCAST, self._on_power_broadcast)
         self._apply_config(initial=True)
+        # 再起動後の状態の知らせ(契約追加 v0.2): 全モジュールの購読が済んでから1回だけ
+        self.ctx.call_soon(self._announce_restored)
         cfg = self.service.config
         bad = cfg.invalid_modes()
         if bad or cfg.issues:
             lines = [f"「{m.label}」: {m.reason()}" for m in bad] + cfg.issues
             self.ctx.notify("ModeShift: 無効な設定があります", "\n".join(lines[:6]), level="warn")
 
+    def _announce_restored(self) -> None:
+        """前回の起動で切り替えて、まだ元に戻していないモードがあれば modeshift.switched を1回だけ送る(restored: true)。
+        「このモード中は止める」側が再起動後も今のモードを知れるようにする。通知・アクション・ops.jsonl の記録はしない。"""
+        svc = self.service
+        if svc is None:
+            return
+        cur = svc.state.data.get("current_mode")
+        run_id = svc.state.data.get("last_run_id")
+        if not isinstance(cur, str) or svc.config.mode(cur) is None:
+            return                     # 設定から消えたモードは送らない
+        snap = svc.snapshots.load()    # 直前の操作が「その切替」で、元に戻していないときだけ
+        if snap is None or snap.get("undone_at") or snap.get("mode_to") != cur or snap.get("run_id") != run_id:
+            return
+        try:
+            self.ctx.emit("modeshift.switched", {"mode": cur, "run_id": run_id if isinstance(run_id, str) else "",
+                                                 "failed": 0, "restored": True})
+        except Exception:  # noqa: BLE001
+            log.exception("modeshift.switched(restored)を送れません")
+
     def stop(self) -> None:
         if self._auto is not None:
             self._auto.stop()
             self._auto = None
+        self._power_watch = None
         if self.service is not None:
             self.service.shutdown()
         for w in (self._preview, self._picker):
@@ -72,6 +97,31 @@ class ModeShiftModule:
         from deskkit.modules.modeshift.stats import usage_series
 
         return usage_series(self.ctx.data_dir / "ops.jsonl", days)
+
+    def diagnostics(self) -> dict[str, str | int | bool]:
+        """診断レポート(契約 §1)用の要約。件数・モード名・真偽・結果コードだけ(exe 名・パス・URL・タイトルを入れない)。"""
+        svc = self.service
+        if svc is None:
+            return {"running": False}
+        cfg = svc.config
+        cur = svc.state.data.get("current_mode")
+        return {
+            "running": True,
+            "modes": len(cfg.modes),
+            "modes_valid": len(cfg.valid_modes()),
+            "modes_unconfirmed": sum(1 for m in cfg.valid_modes() if not m.confirmed),
+            "current_mode": cur if isinstance(cur, str) and cfg.mode(cur) is not None else "",
+            "busy": svc.busy,
+            "undo_available": svc.undo_info() is not None,
+            "last_result": svc.last_result,
+            "preview_policy": cfg.preview,
+            "allow_force_kill": cfg.allow_force_kill,
+            "auto_switch_enabled": cfg.auto_enabled,
+            "auto_switch_active": cfg.auto_active,
+            "auto_rules_exe": sum(1 for r in cfg.rules if r.trigger == "exe"),
+            "auto_rules_power": sum(1 for r in cfg.rules if r.trigger != "exe"),
+            "auto_rules_invalid": sum(1 for r in cfg.rules if r.error),
+        }
 
     def create_page(self) -> Any:
         from deskkit.modules.modeshift.page import ModeShiftPage
@@ -278,28 +328,64 @@ class ModeShiftModule:
         return False
 
     # ---------------------------------------------------------------- 自動切替(FR-23)
+    def _snoozed(self) -> bool:
+        """契約 §1: 一時停止中は自動の切替・元に戻すをしない(利用者が手で押した操作は止めない)。"""
+        fn = getattr(self.ctx, "is_snoozed", None)
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001 - 読めなければ止めない側(従来どおり)に倒す
+            log.exception("is_snoozed を読めません")
+            return False
+
+    def auto_appear(self, rule: AutoRule) -> None:
+        """自動切替のきっかけ(exe の起動・電源の切り替わり)→ モード適用。未確認モードは service が通知だけにする。"""
+        svc = self.service
+        if svc is None:
+            return
+        if self._snoozed():
+            log.info("自動切替: 一時停止中のため %s を適用しない(きっかけ: %s)", rule.mode, rule.trigger)
+            return
+        svc.switch_mode(rule.mode, dry_run=False, source="auto")
+
+    def auto_vanish(self, rule: AutoRule) -> None:
+        """きっかけが終わった(exe の終了・電源が戻った)→ on_exit=undo なら、直前の切替がそのモードのときだけ元に戻す。"""
+        svc = self.service
+        if svc is None:
+            return
+        if self._snoozed():
+            log.info("自動切替: 一時停止中のため元に戻さない(きっかけ: %s)", rule.trigger)
+            return
+        snap = svc.undo_info()
+        if snap is not None and snap.get("mode_to") == rule.mode:
+            svc.request_undo(dry_run=False, source="auto")
+        else:
+            log.info("自動切替: 直前の切替が %s ではないため元に戻さない", rule.mode)
+
+    def _on_power_broadcast(self, wparam: int, lparam: int) -> None:
+        w = self._power_watch
+        if w is not None:
+            w.handle(wparam, lparam)
+
     def _restart_auto(self) -> None:
         if self._auto is not None:
             self._auto.stop()
             self._auto = None
+        self._power_watch = None
         svc = self.service
-        if svc is None or not svc.config.auto_active:
+        if svc is None:
+            return
+        cfg = svc.config
+        if cfg.auto_power_active:
+            self._power_watch = PowerSourceWatcher(svc.backends.power.ac_online, cfg.rules, self.auto_appear, self.auto_vanish)
+        if not cfg.auto_poll_active:
             return
         procs = svc.backends.processes
 
         def names() -> set[str]:
             return {p.exe for p in procs.list_processes()}
 
-        def appear(rule: AutoRule) -> None:
-            svc.switch_mode(rule.mode, dry_run=False, source="auto")
-
-        def vanish(rule: AutoRule) -> None:
-            snap = svc.undo_info()
-            if snap is not None and snap.get("mode_to") == rule.mode:
-                svc.request_undo(dry_run=False, source="auto")
-            else:
-                log.info("自動切替: 直前の切替が %s ではないため元に戻さない", rule.mode)
-
-        self._auto = AutoSwitcher(names, float(svc.config.poll_interval_s or 0), svc.config.rules, appear, vanish,
+        self._auto = AutoSwitcher(names, float(cfg.poll_interval_s or 0), cfg.rules, self.auto_appear, self.auto_vanish,
                                   self.ctx.call_soon)
         self._auto.start()

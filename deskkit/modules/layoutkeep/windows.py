@@ -6,7 +6,8 @@ from collections.abc import Iterable, Sequence
 
 from ._win32 import Win32Api
 from .config import Target
-from .model import RawWindow, Rect, WindowInfo, exe_basename
+from .model import RawMonitor, RawWindow, Rect, WindowInfo, exe_basename
+from .monitors import placement_to_screen_candidates, screen_to_workspace
 
 # 除外の種類(excluded:<種類>)
 EXCLUDE_LABELS = {
@@ -24,21 +25,19 @@ EXCLUDE_LABELS = {
 }
 
 
-def effective_normal_rect(raw: RawWindow, offset: tuple[int, int]) -> tuple[Rect | None, bool]:
+def effective_normal_rect(raw: RawWindow, mons: Sequence[RawMonitor]) -> tuple[Rect | None, bool]:
     """(戻す基準にする normal_rect(ワークスペース座標), スナップ中か)。
     通常表示で GetWindowRect が rcNormalPosition(スクリーン座標に換算)と違えば Aero スナップ等とみなし、
-    今の見た目の矩形をワークスペース座標に戻して使う(rcNormalPosition はスナップ前の位置のため)。"""
+    今の見た目の矩形をワークスペース座標に戻して使う(rcNormalPosition はスナップ前の位置のため)。
+    換算のずれはウィンドウが載っているモニタの作業領域で決まる(主モニタのずれを全モニタに使わない)。"""
     p = raw.placement
     if p is None:
         return None, False
-    if p.show != "normal" or raw.screen_rect is None:
+    if p.show != "normal" or raw.screen_rect is None or not mons:
         return p.normal_rect, False
-    ox, oy = offset
-    n = p.normal_rect
-    if (n[0] + ox, n[1] + oy, n[2] + ox, n[3] + oy) == raw.screen_rect:
-        return n, False
-    s = raw.screen_rect
-    return (s[0] - ox, s[1] - oy, s[2] - ox, s[3] - oy), True
+    if raw.screen_rect in placement_to_screen_candidates(p.normal_rect, mons):
+        return p.normal_rect, False
+    return screen_to_workspace(raw.screen_rect, mons), True
 
 
 def exclusion_of(raw: RawWindow, own_pid: int, game_processes: frozenset[str], exclude_classes: frozenset[str]) -> str | None:

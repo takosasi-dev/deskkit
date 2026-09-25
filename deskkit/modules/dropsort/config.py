@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from deskkit.modules.dropsort import template
+
 MODES = ("dry-run", "apply")
 WATCH_MODES = ("rdcw", "poll")
 
@@ -24,6 +26,7 @@ DEFAULTS: dict[str, Any] = {
     "undo_default_count": 1,
     "archive": {"enabled": False, "mode": "dry-run", "idle_days": 30, "dir_name": "_archive", "use_atime": False},
     "hotkeys": {"undo_last": ""},
+    "pause_in_modes": [],   # ModeShift のこのモード中は自動の整理を止める(契約 §2 の M3)
     "rules": [],
 }
 
@@ -113,6 +116,16 @@ class RuleDef:
     def apply(self) -> bool:
         return self.mode == "apply"
 
+    @property
+    def is_template(self) -> bool:
+        """移動先に {yyyy} などのプレースホルダがある(D2)。"""
+        return self.error is None and template.has_placeholder(self.dest)
+
+    @property
+    def base_dest(self) -> str:
+        """検査と「フォルダを作成」の対象になる、利用者が決めたフォルダ(テンプレートならその前の部分)。"""
+        return template.base(self.dest) if self.is_template else self.dest
+
 
 @dataclass(frozen=True)
 class ArchiveCfg:
@@ -138,6 +151,7 @@ class Config:
     archive: ArchiveCfg
     hotkey_undo_last: str
     rules: tuple[RuleDef, ...]
+    pause_in_modes: tuple[str, ...] = ()
 
 
 def _num(sec: dict[str, Any], key: str, lo: float, hi: float, *, integer: bool = True) -> Any:
@@ -177,6 +191,10 @@ def parse_rule(i: int, raw: Any) -> RuleDef:
             raise ValueError(f"mode は {' / '.join(MODES)} のどちらかにしてください")
         if not isinstance(dest, str) or not dest.strip():
             raise ValueError("移動先(dest)が空です")
+        if template.has_placeholder(dest):
+            terr = template.validate(dest)
+            if terr is not None:
+                raise ValueError(terr)
         m = raw.get("match") or {}
         if not isinstance(m, dict):
             raise ValueError("match がオブジェクトではありません")
@@ -252,6 +270,9 @@ def load_config(section: dict[str, Any]) -> Config:
     rules_raw = sec.get("rules")
     if not isinstance(rules_raw, list):
         raise ConfigError("rules は配列にしてください")
+    pim = sec.get("pause_in_modes")
+    if not isinstance(pim, list) or not all(isinstance(x, str) for x in pim):
+        raise ConfigError("pause_in_modes はモード名(文字列)の配列にしてください")
     return Config(
         paused=bool(sec["paused"]),
         downloads_dir_override=ov.strip() if isinstance(ov, str) and ov.strip() else None,
@@ -267,4 +288,5 @@ def load_config(section: dict[str, Any]) -> Config:
                            dn.strip(), bool(arch["use_atime"])),
         hotkey_undo_last=str(hk.get("undo_last") or ""),
         rules=tuple(parse_rule(i, r) for i, r in enumerate(rules_raw)),
+        pause_in_modes=tuple(dict.fromkeys(x.strip() for x in pim if x.strip())),
     )

@@ -22,6 +22,7 @@ from deskkit.modules.modeshift.system import (
     PowerScheme,
     ProcInfo,
     SessionInfo,
+    ThemeState,
 )
 
 # 実機の powercfg /list に出た GUID(§8.6: 実物に無い GUID をテストに書かない)。偽の電源の中でだけ使う
@@ -29,9 +30,34 @@ GUID_A = "381b4222-f694-41f0-9685-ff5bb260df2e"   # バランス
 GUID_B = "89ee7eba-0db4-4b3a-8c33-69689521f195"   # dynabook 標準
 
 
+class FakeForceHandle:
+    """ForceTarget の偽物。開いた時点のプロセス(世代)に結び付き、PID が再利用されても別のプロセスは終了させない。"""
+
+    def __init__(self, owner: FakeProcesses, pid: int, gen: int) -> None:
+        self.owner, self.pid, self.gen = owner, pid, gen
+        self.closed = False
+
+    def alive(self) -> bool:
+        return not self.closed and self.owner.gens.get(self.pid) == self.gen and self.pid in self.owner.procs
+
+    def terminate_confirmed(self) -> tuple[bool, str]:
+        if not self.alive():
+            return False, "偽: 既に終了していた"
+        self.owner.forced.append(self.pid)
+        with self.owner.lock:
+            self.owner.procs.pop(self.pid, None)
+            self.owner.gens.pop(self.pid, None)
+        return True, "偽: 強制終了"
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeProcesses:
     def __init__(self) -> None:
         self.procs: dict[int, str] = {}
+        self.gens: dict[int, int] = {}                # PID → プロセスの世代(PID の再利用を表す)
+        self.handles: list[FakeForceHandle] = []
         self.paths: dict[int, str] = {}
         self.close_behavior: dict[str, str] = {}   # exe → "exit" / "stay" / "notray"
         self.gate: threading.Event | None = None     # wait_exit をここで止める(busy のテスト用)
@@ -45,6 +71,7 @@ class FakeProcesses:
             self._next += 1
             pid = self._next
             self.procs[pid] = exe.lower()
+            self.gens[pid] = self._next
             if path:
                 self.paths[pid] = path
             return pid
@@ -80,11 +107,20 @@ class FakeProcesses:
             self.gate.wait(10)
         return {p for p in pids if p in self.procs}
 
-    def force_terminate_confirmed(self, pid: int) -> tuple[bool, str]:
-        self.forced.append(pid)
+    def reuse_pid(self, pid: int, exe: str) -> None:
+        """pid のプロセスが終わり、同じ PID で別のプロセスが始まった(テスト用)。"""
         with self.lock:
-            self.procs.pop(pid, None)
-        return True, "偽: 強制終了"
+            self._next += 1
+            self.procs[pid] = exe.lower()
+            self.gens[pid] = self._next
+            self.paths.pop(pid, None)
+
+    def open_for_force(self, pid: int, exe: str) -> FakeForceHandle | None:
+        if self.procs.get(pid) != exe.lower():
+            return None
+        h = FakeForceHandle(self, pid, self.gens.get(pid, 0))
+        self.handles.append(h)
+        return h
 
 
 class FakeLauncher:
@@ -109,6 +145,7 @@ class FakePower:
         self.active: str | None = active
         self.set_calls: list[str] = []
         self.broken = False   # 出力書式が想定外(GUID が読めない)
+        self.ac: bool | None = True   # 電源のきっかけ用(True = AC / False = バッテリー / None = 不明)
 
     def list_schemes(self) -> list[PowerScheme]:
         return [PowerScheme(s.guid, s.name, s.guid == self.active) for s in self.schemes]
@@ -121,12 +158,17 @@ class FakePower:
         self.active = guid
         return True, "読み戻して一致を確認"
 
+    def ac_online(self) -> bool | None:
+        return self.ac
+
 
 class FakeAudio:
     def __init__(self) -> None:
         self.master: MasterState | None = MasterState(0.62, False, "{dev-1}")
         self.sessions: dict[str, SessionInfo] = {}
         self.master_calls: list[tuple[float | None, bool | None]] = []
+        self.capture: MasterState | None = MasterState(0.8, False, "{mic-1}")
+        self.capture_calls: list[tuple[float | None, bool | None]] = []
         self.session_calls: list[dict[str, float]] = []
 
     def add_session(self, sid: str, pid: int, level: float = 1.0) -> None:
@@ -143,6 +185,17 @@ class FakeAudio:
         self.master = MasterState(m.level if level is None else level, m.mute if mute is None else mute, m.device_id)
         return self.master
 
+    def get_capture(self) -> MasterState | None:
+        return self.capture
+
+    def set_capture(self, level: float | None, mute: bool | None) -> MasterState | None:
+        self.capture_calls.append((level, mute))
+        if self.capture is None:
+            return None
+        c = self.capture
+        self.capture = MasterState(c.level if level is None else level, c.mute if mute is None else mute, c.device_id)
+        return self.capture
+
     def list_sessions(self) -> list[SessionInfo]:
         return list(self.sessions.values())
 
@@ -157,6 +210,24 @@ class FakeAudio:
             self.sessions[sid] = SessionInfo(sid, s.pid, lv, s.mute)
             out[sid] = lv
         return out
+
+
+class FakeTheme:
+    """HKCU の Personalize キーと WM_SETTINGCHANGE の偽物。実機のテーマには触らない。"""
+
+    def __init__(self) -> None:
+        self.state = ThemeState("light", "dark")
+        self.set_calls: list[tuple[str | None, str | None]] = []
+        self.broadcasts = 0
+
+    def get(self) -> ThemeState:
+        return self.state
+
+    def set(self, apps: str | None, system: str | None) -> tuple[ThemeState | None, str]:
+        self.set_calls.append((apps, system))
+        self.state = ThemeState(apps or self.state.apps, system or self.state.system)
+        self.broadcasts += 1
+        return self.state, ""
 
 
 class FakeOpener:
@@ -179,14 +250,15 @@ class FakeSystem:
     power: FakePower
     audio: FakeAudio
     opener: FakeOpener
+    theme: FakeTheme
 
     def backends(self) -> Backends:
-        return Backends(self.procs, self.launcher, self.power, self.audio, self.opener)
+        return Backends(self.procs, self.launcher, self.power, self.audio, self.opener, self.theme)
 
 
 def fake_system() -> FakeSystem:
     p = FakeProcesses()
-    return FakeSystem(p, FakeLauncher(p), FakePower(), FakeAudio(), FakeOpener())
+    return FakeSystem(p, FakeLauncher(p), FakePower(), FakeAudio(), FakeOpener(), FakeTheme())
 
 
 # ------------------------------------------------------------------ ModuleContext の偽物
@@ -281,6 +353,8 @@ class FakeCtx:
         self.quick: list[tuple[str, Callable[[], None], str, str | None, Callable[[], bool] | None]] = []
         self.status = ""
         self.writes = 0
+        self.snoozed = False                 # 契約 §1: ctx.is_snoozed()(既定 False)
+        self.native: dict[int, list[Callable[[int, int], None]]] = {}
         self._q: queue.Queue[Callable[[], None]] = queue.Queue()
 
     def settings(self) -> Mapping[str, Any]:
@@ -295,6 +369,17 @@ class FakeCtx:
 
     def game_processes(self) -> frozenset[str]:
         return self._games
+
+    def is_snoozed(self) -> bool:
+        return self.snoozed
+
+    def on_native(self, msg: int, handler: Callable[[int, int], None]) -> None:
+        self.native.setdefault(msg, []).append(handler)
+
+    def fire_native(self, msg: int, wparam: int = 0, lparam: int = 0) -> None:
+        """隠しウィンドウにメッセージが届いた(テスト用)。"""
+        for h in list(self.native.get(msg, [])):
+            h(wparam, lparam)
 
     def add_tray_action(self, label: str, callback: Callable[[], None], *, checkable: bool = False,
                         checked: bool = False, submenu: str | None = None) -> FakeTrayItem:
@@ -376,6 +461,7 @@ class FakeUi:
         self.finished: list[Plan] = []
         self.force_answer = False
         self.force_asked: list[tuple[str, int]] = []
+        self.on_force_ask: Callable[[str, int], None] | None = None   # 確認ダイアログを待つ間に起きることを差し込む
 
     def show_preview(self, plan: Plan) -> None:
         self.previews.append(plan)
@@ -388,6 +474,8 @@ class FakeUi:
 
     def confirm_force(self, exe: str, pid: int) -> bool:
         self.force_asked.append((exe, pid))
+        if self.on_force_ask is not None:
+            self.on_force_ask(exe, pid)
         return self.force_answer
 
 

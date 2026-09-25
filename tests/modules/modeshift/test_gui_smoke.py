@@ -81,3 +81,46 @@ def test_action_dialogs_and_pickers(app: QApplication, tmp_path: Path) -> None:
     app.processEvents()
     picker.close()
     mod.stop()
+
+
+def test_auto_rules_table_with_power_trigger(app: QApplication, tmp_path: Path) -> None:
+    mod, ctx = _module(tmp_path)
+    sec = ctx.settings_dict()
+    sec["auto_switch"] = {"enabled": True, "poll_interval_s": 2.0, "rules": [
+        {"exe": "game.exe", "mode": "game", "on_exit": "undo"},
+        {"trigger": "on_battery", "mode": "study", "on_exit": "undo"},
+    ]}
+    mod.save_section(sec)
+    page = mod.create_page()
+    page.show()
+    app.processEvents()
+    assert page.rules.rowCount() == 2
+    page._add_power_rule()
+    assert page.rules.rowCount() == 3
+    exe_cell = page.rules.cellWidget(1, 1)
+    assert exe_cell is not None and not exe_cell.isEnabled()      # 電源のきっかけでは exe を使わない
+    page.rules.removeRow(2)
+    page._save_rules()
+    rules = ctx.settings_dict()["auto_switch"]["rules"]
+    assert rules == [{"exe": "game.exe", "mode": "game", "on_exit": "undo"},
+                     {"trigger": "on_battery", "mode": "study", "on_exit": "undo"}]
+    assert "監視中(2 秒ごと)・電源" in page.auto_pill.text()
+    page.close()
+    mod.stop()
+
+
+def test_new_action_dialogs_collect_values(app: QApplication, tmp_path: Path) -> None:
+    mod, _ctx = _module(tmp_path)
+    dlg = ActionDialog(None, mod, {"type": "theme", "apps": "light", "system": "dark"})
+    assert dlg._validate() == [] and dlg.result_action() == {"type": "theme", "apps": "light", "system": "dark"}
+    dlg.close()
+    dlg = ActionDialog(None, mod, {"type": "mic_volume", "level": None, "mute": True})
+    assert dlg._validate() == [] and dlg.result_action() == {"type": "mic_volume", "level": None, "mute": True}
+    dlg.close()
+    dlg = ActionDialog(None, mod, {"type": "layout_apply", "layout": "a", "wait_s": 0, "preset": "作業"})
+    assert dlg.result_action().get("preset") == "作業"
+    dlg.close()
+    dlg = ActionDialog(None, mod, {"type": "layout_apply", "layout": "a", "wait_s": 0})
+    assert "preset" not in dlg.result_action()
+    dlg.close()
+    mod.stop()

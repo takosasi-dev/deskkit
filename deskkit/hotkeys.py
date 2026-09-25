@@ -68,7 +68,23 @@ class HotkeyHub:
         self.registry = HotkeyRegistry(hwnd)
         self._callbacks: dict[str, list[Callable[[], None]]] = {}
         self.registry.triggered.connect(self._on_triggered)
-        self.conflicts: list[tuple[str, str]] = []  # (完全名, 表記)
+        self.conflicts: list[tuple[str, str]] = []  # (完全名, 表記)。起動・再読み込みごとに通知して空にする
+        self.combos: dict[str, tuple[int, int]] = {}  # 完全名 → (modifiers, vk)。表示・診断用
+        self.failed: dict[str, str] = {}  # 登録できなかったもの(完全名 → 表記)。診断用に次の全解除まで残す
+
+    def register(self, full_name: str, modifiers: int, vk: int) -> None:
+        """registry へ登録し、表示用に組み合わせを覚える。失敗は HotkeyError(競合は HotkeyConflictError)。"""
+        self.registry.register(full_name, modifiers, vk)
+        self.combos[full_name] = (modifiers, vk)
+        self.failed.pop(full_name, None)
+
+    def combo_text(self, full_name: str) -> str | None:
+        c = self.combos.get(full_name)
+        return format_hotkey(*c) if c else None
+
+    def note_conflict(self, full_name: str, text: str) -> None:
+        self.conflicts.append((full_name, text))
+        self.failed[full_name] = text
 
     def _on_triggered(self, full_name: str) -> None:
         for cb in list(self._callbacks.get(full_name, [])):
@@ -80,11 +96,14 @@ class HotkeyHub:
     def drop(self, full_name: str) -> None:
         self.registry.unregister(full_name)
         self._callbacks.pop(full_name, None)
+        self.combos.pop(full_name, None)
 
     def unregister_all(self) -> None:
         self.registry.unregister_all()
         self._callbacks.clear()
         self.conflicts.clear()
+        self.combos.clear()
+        self.failed.clear()
 
 
 class _TriggeredProxy:
@@ -110,9 +129,9 @@ class ModuleHotkeys:
     def register(self, name: str, modifiers: int, vk: int) -> None:
         full = self._full(name)
         try:
-            self._hub.registry.register(full, modifiers, vk)
+            self._hub.register(full, modifiers, vk)
         except HotkeyConflictError:
-            self._hub.conflicts.append((full, format_hotkey(modifiers, vk)))
+            self._hub.note_conflict(full, format_hotkey(modifiers, vk))
             raise
         self._names.add(full)
 
@@ -124,7 +143,7 @@ class ModuleHotkeys:
             mods, vk = parse_hotkey(text)
         except ValueError as e:
             self._ctx.log.warning("hotkey parse error name=%s: %s", name, e)
-            self._hub.conflicts.append((self._full(name), f"{text}(解釈不能)"))
+            self._hub.note_conflict(self._full(name), f"{text}(解釈不能)")
             return False
         try:
             self.register(name, mods, vk)

@@ -23,7 +23,12 @@ DEFAULTS: dict[str, Any] = {
     "exclude_classes": [],
     "hotkeys": {"save": "", "apply": ""},
     "names": {},
+    # L2: 構成が落ち着いている間の自動スナップショット(DeskKit のデータを書くだけなので既定でオン)
+    "auto_snapshot": {"enabled": True, "stable_min": 10, "interval_min": 30},
+    # L3: 新しく開いたウィンドウを保存位置へ置く(既定オフ・試運転から)
+    "place_new": {"enabled": False, "mode": "dry_run", "poll_ms": 1500},
 }
+NESTED = ("signature", "hotkeys", "auto_snapshot", "place_new")
 
 ID_SOURCE_LABELS = {
     "device_interface": "デバイスインタフェース",
@@ -48,6 +53,12 @@ class Target:
         return {"exe": self.exe, "class": self.cls, "title_regex": self.title_regex}
 
     def matches(self, exe_path: str | None, cls: str, title: str) -> bool:
+        if not self.matches_exe_class(exe_path, cls):
+            return False
+        return not (self.pattern is not None and not self.pattern.search(title))
+
+    def matches_exe_class(self, exe_path: str | None, cls: str) -> bool:
+        """exe とクラスだけの照合(タイトルは後から変わるので、新規ウィンドウの一次ふるい分けに使う)。"""
         if not exe_path:
             return False
         want = self.exe.strip().lower()
@@ -57,9 +68,7 @@ class Target:
                 return False
         elif have.rsplit("\\", 1)[-1] != want:
             return False
-        if self.cls and self.cls != cls:
-            return False
-        return not (self.pattern is not None and not self.pattern.search(title))
+        return not (self.cls and self.cls != cls)
 
 
 @dataclass
@@ -76,10 +85,21 @@ class Config:
     hotkeys: dict[str, str]
     names: dict[str, str]
     invalid_targets: list[str] = field(default_factory=list)  # 無効にした targets の説明(タイトルは含めない)
+    snapshot_enabled: bool = True
+    snapshot_stable_min: int = 10
+    snapshot_interval_min: int = 30
+    place_enabled: bool = False
+    place_mode: str = "dry_run"
+    place_poll_ms: int = 1500
 
     @property
     def live(self) -> bool:
         return self.mode == "live"
+
+    @property
+    def place_live(self) -> bool:
+        """新規ウィンドウの配置を実際に行うか。全体の mode も live のときだけ(INV-7: dry_run 中は1回も動かさない)。"""
+        return self.place_enabled and self.place_mode == "live" and self.live
 
 
 def _int(v: Any, default: int, lo: int, hi: int) -> int:
@@ -96,16 +116,12 @@ def fill_defaults(section: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         if k not in sec:
             sec[k] = copy.deepcopy(v)
             changed = True
-    if isinstance(sec.get("signature"), dict):
-        for k, v in DEFAULTS["signature"].items():
-            if k not in sec["signature"]:
-                sec["signature"][k] = copy.deepcopy(v)
-                changed = True
-    if isinstance(sec.get("hotkeys"), dict):
-        for k, v in DEFAULTS["hotkeys"].items():
-            if k not in sec["hotkeys"]:
-                sec["hotkeys"][k] = v
-                changed = True
+    for name in NESTED:
+        if isinstance(sec.get(name), dict):
+            for k, v in DEFAULTS[name].items():
+                if k not in sec[name]:
+                    sec[name][k] = copy.deepcopy(v)
+                    changed = True
     return sec, changed
 
 
@@ -156,6 +172,8 @@ def parse(section: Mapping[str, Any]) -> Config:
     exclude = frozenset(x for x in ex if isinstance(x, str) and x) if isinstance(ex, list) else frozenset()
     hk = as_dict(sec.get("hotkeys"))
     names_raw = as_dict(sec.get("names"))
+    snap = as_dict(sec.get("auto_snapshot"))
+    place = as_dict(sec.get("place_new"))
     return Config(
         mode=str(mode),
         auto_apply=bool(sec.get("auto_apply") is True),
@@ -169,4 +187,10 @@ def parse(section: Mapping[str, Any]) -> Config:
         hotkeys={"save": str(hk.get("save") or ""), "apply": str(hk.get("apply") or "")},
         names={str(k): str(v) for k, v in names_raw.items() if isinstance(v, str) and v.strip()},
         invalid_targets=invalid,
+        snapshot_enabled=snap.get("enabled") is not False,
+        snapshot_stable_min=_int(snap.get("stable_min"), 10, 1, 240),
+        snapshot_interval_min=_int(snap.get("interval_min"), 30, 5, 1440),
+        place_enabled=place.get("enabled") is True,
+        place_mode="live" if place.get("mode") == "live" else "dry_run",  # 不正な値は安全側(試運転)に倒す
+        place_poll_ms=_int(place.get("poll_ms"), 1500, 1000, 10_000),
     )

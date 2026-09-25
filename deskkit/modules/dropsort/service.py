@@ -17,13 +17,14 @@ from typing import Any
 from deskkit.modules.dropsort import archive as arch
 from deskkit.modules.dropsort import guard
 from deskkit.modules.dropsort import motw as motw_mod
-from deskkit.modules.dropsort._win32 import ERROR_SUCCESS, FileInfo, Win32Api
+from deskkit.modules.dropsort import template as tpl
+from deskkit.modules.dropsort._win32 import ERROR_ALREADY_EXISTS, ERROR_SUCCESS, FileInfo, Win32Api
 from deskkit.modules.dropsort.completion import LOCKED, LOCKED_GIVEUP, PENDING, CompletionTracker
 from deskkit.modules.dropsort.config import Config, RuleDef
 from deskkit.modules.dropsort.motw import Motw
 from deskkit.modules.dropsort.mover import Mover, Outcome
 from deskkit.modules.dropsort.oplog import JsonlLog, LockBusyError, OpLock, iso
-from deskkit.modules.dropsort.paths import DestCheck, check_dest, resolve_downloads
+from deskkit.modules.dropsort.paths import DestCheck, check_dest, is_under, norm, resolve_downloads
 from deskkit.modules.dropsort.rules import first_match
 from deskkit.modules.dropsort.scanner import scan_dir
 from deskkit.modules.dropsort.state import DirState, StateStore
@@ -51,6 +52,8 @@ REASON_TEXT = {
     "baseline": "基準線(sort-existing で扱います)",
     "not_stable": "ダウンロード中か、更新されたばかりです",
     "invalid_rule": "ルールが無効です",
+    "dest_escape": "移動先がルールのフォルダの外を指しています(リンク)",
+    "dest_create_failed": "移動先のフォルダを作成できませんでした",
 }
 
 OP_TEXT = {
@@ -100,6 +103,11 @@ class UndoResult:
     nothing: bool = False
 
 
+def file_time(f: FileInfo) -> float:
+    """テンプレートの日付の元: ダウンロードフォルダに来た時刻(作成時刻)。取れなければ更新時刻。"""
+    return f.ctime if f.ctime > 0 else f.mtime
+
+
 class DropSortService:
     def __init__(self, api: Win32Api, data_dir: Path, cfg: Config, *, clock: Callable[[], float] = time.time,
                  log: logging.Logger | None = None) -> None:
@@ -116,6 +124,8 @@ class DropSortService:
         self.mover = Mover(api, cfg.max_suffix, self.log)
         self._mu = threading.Lock()
         self._snap_mu = threading.Lock()
+        # 停止の要求(モジュールの stop から)。ファイル1件の処理の途中では見ず、次のファイルへ進む前に見る
+        self.cancel = threading.Event()
         self.downloads: str | None = None
         self.rule_checks: dict[int, DestCheck] = {}
         self._problem_sig: tuple[tuple[int, str], ...] = ()
@@ -152,7 +162,8 @@ class DropSortService:
                 checks[r.index] = DestCheck(False, "invalid_rule", r.error)
                 problems.append((r, r.error))
                 continue
-            c = check_dest(self.api, r.dest, downloads, self.cfg.archive.dir_name)
+            # テンプレート(D2)は基準フォルダ(利用者が決めた部分)を検査する。展開後は移動の直前に検査する
+            c = check_dest(self.api, r.base_dest, downloads, self.cfg.archive.dir_name)
             checks[r.index] = c
             if not c.ok:
                 problems.append((r, c.message or reason_text(c.code)))
@@ -185,17 +196,21 @@ class DropSortService:
     # ------------------------------------------------------------ 判定 → 記録 / 実行
     def _decide(self, ds: DirState | None, f: FileInfo, m: Motw, dest_dir: str, rule: RuleDef | None, *,
                 kind: str, apply: bool, source: str, events: list[dict[str, Any]] | None, dedupe: bool,
-                log_dry: bool = True) -> dict[str, Any]:
-        """kind は move / archive。戻り値は表示用の1件。"""
+                log_dry: bool = True, template_base: str | None = None) -> dict[str, Any]:
+        """kind は move / archive。戻り値は表示用の1件。template_base はテンプレートの基準フォルダ(実パス)。"""
         rec = self._base_rec(f, m, rule, source)
         prev = ds.handled_for(f.name, f.size, f.mtime) if ds is not None else None
         if not apply:
             plan_dir = dest_dir
-            if kind == "archive" and not self.api.is_dir(dest_dir):
+            missing = not self.api.is_dir(dest_dir)
+            if missing and kind == "archive":
                 plan_dir = ntpath.dirname(ntpath.dirname(dest_dir))  # まだ無い月フォルダ: ダウンロード自身で FS を判定
+            elif missing and template_base is not None:
+                plan_dir = template_base  # まだ無いテンプレートの行き先: 基準フォルダで FS を判定(作りはしない)
             p = self.mover.plan(f.path, plan_dir, m)
             op = ("would_archive" if kind == "archive" else "would_move") if p.ok else "would_refuse"
-            dst = ntpath.join(dest_dir, ntpath.basename(p.dst)) if (p.ok and p.dst) else dest_dir
+            # 行き先がまだ無ければ名前は衝突しない(基準フォルダでの衝突は関係ない)
+            dst = ntpath.join(dest_dir, f.name if missing else ntpath.basename(p.dst)) if (p.ok and p.dst) else dest_dir
             rec.update(op=op, dst=dst, dst_fs=p.dst_fs, reason=p.reason)
             sig = f"{op}|{rec['rule']}|{dest_dir}|{p.reason}"
             if ds is not None:
@@ -205,8 +220,11 @@ class DropSortService:
                 if events is not None:
                     events.append(dict(rec, name=f.name))
             return dict(rec, name=f.name)
+        prep = self._prepare_template_dir(dest_dir, template_base) if template_base is not None else None
         if kind == "archive" and not arch.ensure_dir(self.api, dest_dir):
             out = Outcome("failed", None, "move_error")
+        elif prep is not None:
+            out = Outcome("failed" if prep in ("dest_create_failed", "dest_unavailable") else "refused", None, prep)
         else:
             out = self.mover.move(f.path, dest_dir, m, f.size, f.mtime)
         if out.kind == "skipped":
@@ -237,9 +255,46 @@ class DropSortService:
                 events.append(dict(rec, name=f.name))
         return dict(rec, name=f.name)
 
-    def _dest_for(self, rule: RuleDef) -> str:
+    def _dest_for(self, rule: RuleDef, f: FileInfo, m: Motw) -> tuple[str, str | None]:
+        """(移動先フォルダ, テンプレートの基準フォルダ or None)。基準フォルダは検査済みの実パスに置き換える。"""
         c = self.rule_checks.get(rule.index)
-        return (c.final if c and c.final else rule.dest)
+        final = c.final if c and c.final else None
+        if not rule.is_template:
+            return final or rule.dest, None
+        b = final or rule.base_dest
+        return tpl.expand(rule.dest, tpl.TemplateVars(file_time(f), f.name, m.domain), b), b
+
+    def _prepare_template_dir(self, dest: str, base_final: str) -> str | None:
+        """テンプレートの行き先を用意する(D2)。基準フォルダの下だけに、足りないフォルダを作る。
+        作ったフォルダは元に戻す(undo)でも消さない。問題があれば理由コードを返す(ファイルは動かさない)。"""
+        api = self.api
+        if not is_under(dest, base_final) or norm(dest) == norm(base_final):
+            return "dest_escape"
+        missing: list[str] = []
+        cur = dest
+        while not api.is_dir(cur):
+            if norm(cur) == norm(base_final) or not is_under(cur, base_final):
+                return "dest_unavailable"  # 基準フォルダ自体が無い(未接続など)。基準フォルダは作らない
+            missing.append(cur)
+            parent = ntpath.dirname(cur)
+            if parent == cur:
+                return "dest_unavailable"
+            cur = parent
+        # 既にある途中のフォルダがリンクで外を指していないか(INV-11: 最終パスで判定)
+        if not is_under(api.final_path(cur) or cur, base_final):
+            return "dest_escape"
+        for d in reversed(missing):
+            e = api.create_directory(d)
+            if e not in (ERROR_SUCCESS, ERROR_ALREADY_EXISTS):
+                self.log.warning("移動先のフォルダを作成できません (Win32 エラー %s): %s", e, d)
+                return "dest_create_failed"
+            self.log.info("移動先のフォルダを作成しました: %s", d)
+        c = check_dest(api, dest, self.downloads, self.cfg.archive.dir_name)
+        if not c.ok:
+            return c.code or "dest_unavailable"
+        if c.final is not None and not is_under(c.final, base_final):
+            return "dest_escape"
+        return None
 
     # ------------------------------------------------------------ 自動処理(1回のフルスキャン)
     def run_cycle(self) -> CycleResult:
@@ -287,6 +342,8 @@ class DropSortService:
         next_check: float | None = None
         events = res.events
         for f in snap.files:
+            if self.cancel.is_set():
+                break  # 停止の要求: 残りは次回のスキャンで扱う(判断は毎回実状態から行うので取りこぼさない)
             key = f.name.lower()
             if ds.in_baseline(f.name, f.size, f.mtime):
                 continue
@@ -325,8 +382,9 @@ class DropSortService:
                 c = self.rule_checks.get(rule.index)
                 if c is not None and c.unavailable:
                     continue  # 移動先が未接続: 今回は見送り、次回再評価
-                r = self._decide(ds, f, m, self._dest_for(rule), rule, kind="move", apply=rule.apply,
-                                 source="auto", events=events, dedupe=True)
+                dest, tbase = self._dest_for(rule, f, m)
+                r = self._decide(ds, f, m, dest, rule, kind="move", apply=rule.apply,
+                                 source="auto", events=events, dedupe=True, template_base=tbase)
                 if r.get("op") == "move":
                     continue
             if cfg.archive.enabled and arch.is_idle(f, ds.first_seen.get(key), cfg.archive, now):
@@ -373,6 +431,8 @@ class DropSortService:
                     ds.baseline[f.name.lower()] = {"name": f.name, "size": f.size, "mtime": f.mtime}
             cfg = self.cfg
             for f in snap.files:
+                if self.cancel.is_set():
+                    break
                 if not ds.in_baseline(f.name, f.size, f.mtime):
                     continue
                 base = {"name": f.name, "src": f.path, "size": f.size, "mtime": iso(f.mtime)}
@@ -396,8 +456,10 @@ class DropSortService:
                     if c is not None and c.unavailable:
                         out.items.append(dict(base, op="skip", reason="dest_unavailable", rule=rule.name))
                         continue
-                    r = self._decide(ds if apply else None, f, m, self._dest_for(rule), rule, kind="move", apply=apply,
-                                     source="sort-existing", events=None, dedupe=False, log_dry=False)
+                    dest, tbase = self._dest_for(rule, f, m)
+                    r = self._decide(ds if apply else None, f, m, dest, rule, kind="move", apply=apply,
+                                     source="sort-existing", events=None, dedupe=False, log_dry=False,
+                                     template_base=tbase)
                     r["rule_mode"] = rule.mode
                     out.items.append(r)
                     continue
@@ -425,6 +487,8 @@ class DropSortService:
             st = self.store.load()
             ds = st.dir(dl)
             for f in snap.files:
+                if self.cancel.is_set():
+                    break
                 key = f.name.lower()
                 in_base = ds is None or ds.in_baseline(f.name, f.size, f.mtime)
                 first = None if (ds is None or in_base) else ds.first_seen.get(key)
@@ -472,6 +536,8 @@ class DropSortService:
                 res.nothing = True
                 return res
             for r in cands[: max(1, count)]:
+                if self.cancel.is_set():
+                    break
                 rid = str(r.get("id"))
                 dst = str(r.get("dst") or "")
                 src = str(r.get("src") or "")

@@ -309,8 +309,8 @@ class Hero(QFrame):
         lay.addWidget(ic)
         tb = QVBoxLayout()
         tb.setSpacing(4)
-        t = label(title, "H1")
-        tb.addWidget(t)
+        self.title_label = label(title, "H1")
+        tb.addWidget(self.title_label)
         self.tag = label(tagline, "Dim", wrap=True)
         tb.addWidget(self.tag)
         self.pills = QHBoxLayout()
@@ -322,6 +322,9 @@ class Hero(QFrame):
         self.right.setSpacing(8)
         self.right.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
         lay.addLayout(self.right)
+
+    def set_title(self, title: str) -> None:
+        self.title_label.setText(title)
 
     def add_pill(self, pill: QWidget) -> None:
         self.pills.insertWidget(self.pills.count() - 1, pill)

@@ -139,7 +139,7 @@ def test_snapshot_save_failure_blocks_execution(env: Env) -> None:
     def boom(_snap: object) -> None:
         raise OSError("disk full")
 
-    env.svc.snapshots.save = boom  # type: ignore[method-assign]
+    env.svc.snapshots.save = boom  # type: ignore[method-assign,assignment]
     code, _ = cli.handle(env.svc, ["game"])
     assert code == 4
     assert env.sys.power.active == GUID_A and not env.sys.launcher.launched
@@ -170,6 +170,67 @@ def test_force_kill_only_with_all_conditions(tmp_path: Path) -> None:
     e.ui.force_answer = True
     e.svc.switch_mode("game", dry_run=False, source="hotkey")
     assert e.sys.procs.forced
+
+
+def _force_env(tmp_path: Path) -> Env:
+    def edit(s: dict) -> None:  # type: ignore[type-arg]
+        s["allow_force_kill"] = True
+        s["modes"][0]["actions"][3]["force_on_timeout"] = True
+
+    e = Env(tmp_path, confirm=True, edit=edit)
+    e.sys.procs.close_behavior["mail.exe"] = "stay"
+    e.ui.force_answer = True
+    return e
+
+
+def test_force_kill_does_not_hit_reused_pid(tmp_path: Path) -> None:
+    """確認ダイアログを待つ間に対象が終わり、同じ PID が別のプロセスに再利用されても、承認で別のプロセスを終了させない。"""
+    e = _force_env(tmp_path)
+    mail_pid = next(p for p, x in e.sys.procs.procs.items() if x == "mail.exe")
+
+    def reuse(_exe: str, pid: int) -> None:
+        e.sys.procs.reuse_pid(pid, "notes.exe")     # mail.exe は自分で終わり、PID が notes.exe に使われた
+
+    e.ui.on_force_ask = reuse
+    e.svc.switch_mode("game", dry_run=False, source="hotkey")
+    assert e.ui.force_asked == [("mail.exe", mail_pid)]
+    assert not e.sys.procs.forced
+    assert e.sys.procs.procs.get(mail_pid) == "notes.exe"            # 別のプロセスは生きている
+    assert e.sys.procs.handles and all(h.closed for h in e.sys.procs.handles)   # ハンドルは必ず閉じる
+    row = next(r for r in e.ops() if r["type"] == "close_app")
+    assert row["result"] == "ok"                                     # 対象はもう居ない
+
+
+def test_force_kill_same_exe_new_instance_is_not_killed(tmp_path: Path) -> None:
+    """再利用先が同じ exe 名の新しいプロセスでも、確認前に開いたハンドルの相手(元のプロセス)以外は終了させない。"""
+    e = _force_env(tmp_path)
+    mail_pid = next(p for p, x in e.sys.procs.procs.items() if x == "mail.exe")
+    e.ui.on_force_ask = lambda _exe, pid: e.sys.procs.reuse_pid(pid, "mail.exe")
+    e.svc.switch_mode("game", dry_run=False, source="hotkey")
+    assert not e.sys.procs.forced and e.sys.procs.procs.get(mail_pid) == "mail.exe"
+    assert all(h.closed for h in e.sys.procs.handles)
+
+
+def test_force_kill_uses_handle_and_closes_it(tmp_path: Path) -> None:
+    e = _force_env(tmp_path)
+    mail_pid = next(p for p, x in e.sys.procs.procs.items() if x == "mail.exe")
+    e.svc.switch_mode("game", dry_run=False, source="hotkey")
+    assert e.sys.procs.forced == [mail_pid] and mail_pid not in e.sys.procs.procs
+    assert len(e.sys.procs.handles) == 1 and e.sys.procs.handles[0].closed
+    # 確認で「しない」でもハンドルは閉じる
+    e2 = _force_env(tmp_path / "b")
+    e2.ui.force_answer = False
+    e2.svc.switch_mode("game", dry_run=False, source="hotkey")
+    assert not e2.sys.procs.forced and e2.sys.procs.handles and all(h.closed for h in e2.sys.procs.handles)
+
+
+def test_force_kill_skips_process_that_cannot_be_opened(tmp_path: Path) -> None:
+    e = _force_env(tmp_path)
+    e.sys.procs.open_for_force = lambda _pid, _exe: None  # type: ignore[method-assign,assignment]   # 昇格プロセス等
+    code, _ = e.svc.switch_mode("game", dry_run=False, source="hotkey")
+    assert code == 0 and not e.ui.force_asked and not e.sys.procs.forced
+    row = next(r for r in e.ops() if r["type"] == "close_app")
+    assert row["result"] == "still_running"
 
 
 def test_close_never_targets_game_exe(env: Env) -> None:
@@ -259,7 +320,20 @@ def test_ac17_ops_append_only_and_count(env: Env) -> None:
     counts = sorted(by_run.values())
     assert counts == sorted([8, 8, 1, 3])   # dry-run 8 / 本番 8 / study dry-run 1 / undo 3 項目
     assert all(set(r) >= {"ts", "run_id", "source", "mode", "dry_run", "step", "type", "target", "result", "reason"} for r in rows)
-    assert "token=secret" not in env.ops_path.read_text(encoding="utf-8")
+    text = env.ops_path.read_text(encoding="utf-8")
+    assert "token=secret" not in text and "?" not in text                 # クエリを書かない
+    assert "example.com/page" not in text and "https://" not in text      # 利用者の判断: ドメインのみ
+    assert {r["target"] for r in rows if r["type"] == "open_url"} == {"example.com"}
+
+
+def test_open_url_log_has_domain_only_but_preview_keeps_path(env: Env) -> None:
+    env.svc.switch_mode("game", dry_run=True, source="tray")
+    step = next(s for s in env.ui.previews[-1].steps if s.type == "open_url")
+    assert step.target == "https://example.com/page?…"                    # 画面(ログではない)は従来どおり
+    cli.handle(env.svc, ["game"])
+    rows = [r for r in env.ops() if r["type"] == "open_url"]
+    assert rows and all(r["target"] == "example.com" for r in rows)
+    assert "/page" not in env.ops_path.read_text(encoding="utf-8")
 
 
 def test_status_and_unknown(env: Env) -> None:

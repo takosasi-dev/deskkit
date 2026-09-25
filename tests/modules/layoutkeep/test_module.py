@@ -198,12 +198,13 @@ def test_display_change_debounce_settle_and_propose(tmp_path: Path, scenario: Sc
 
 def test_power_resume_filter(tmp_path: Path, scenario: Scenario) -> None:
     ctx, mod = _started(tmp_path, scenario)
+    n0 = len(ctx.timers)  # 自動スナップショットの確認タイマ
     for h in ctx.native[WM_POWERBROADCAST]:
         h(0x4, 0)  # PBT_APMSUSPEND は無視
-    assert ctx.timers == []
+    assert len(ctx.timers) == n0
     for h in ctx.native[WM_POWERBROADCAST]:
         h(PBT_APMRESUMEAUTOMATIC, 0)
-    assert len(ctx.timers) == 1
+    assert len(ctx.timers) == n0 + 1
 
 
 def test_auto_apply_in_live(tmp_path: Path, scenario: Scenario) -> None:

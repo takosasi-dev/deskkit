@@ -130,6 +130,38 @@ def test_undecryptable_rows_are_hidden_not_deleted(tmp_path: Path) -> None:
     st.close()
 
 
+def _insert_undecryptable(st: Store, kind: str, pinned: int) -> None:
+    st._db().execute("INSERT INTO items (kind, created_at, last_used_at, pinned, payload) VALUES "
+                     "(?, '2026-01-01T00:00:00+09:00', '2026-01-01T00:00:00+09:00', ?, x'00112233')", (kind, pinned))
+
+
+@pytest.mark.parametrize("include_pins", [False, True])
+def test_clear_all_removes_undecryptable_history_rows(tmp_path: Path, include_pins: bool) -> None:
+    """全消去は、復号できずメモリに載らなかった履歴の行も DB から消す(警告が消えないバグの回帰テスト)。"""
+    st = Store(tmp_path / "c.db", FakeCipher(), FakeClock())
+    st.open()
+    st.add_history("a", None)
+    pin = st.add_history("p", None)
+    st.set_pinned(pin.id, True)
+    st.add_snippet("s", "t")
+    _insert_undecryptable(st, "history", 0)
+    _insert_undecryptable(st, "history", 1)  # 復号できない行はピンの列に関係なく消す
+    _insert_undecryptable(st, "snippet", 0)  # 定型文は消さない
+    st.close()
+    st.open()
+    assert st.undecryptable == 3 and st.undecryptable_counts() == {"history": 2, "snippets": 1}
+    n = st.clear_all(include_pins=include_pins)
+    assert n == (4 if include_pins else 3)
+    assert st.undecryptable == 1 and st.undecryptable_counts() == {"history": 0, "snippets": 1}
+    db = sqlite3.connect(st.path)
+    try:
+        assert db.execute("SELECT COUNT(*) FROM items WHERE kind='history'").fetchone()[0] == (0 if include_pins else 1)
+        assert db.execute("SELECT COUNT(*) FROM items WHERE kind='snippet'").fetchone()[0] == 2
+    finally:
+        db.close()
+    st.close()
+
+
 def test_corrupt_db_is_not_recreated(tmp_path: Path) -> None:
     p = tmp_path / "c.db"
     p.write_bytes(b"this is not a sqlite database at all" * 100)
@@ -145,3 +177,25 @@ def test_ops_rejects_non_scalar(tmp_path: Path) -> None:
     ops = OpsLog(tmp_path / "ops.jsonl")
     with pytest.raises(TypeError):
         ops.write("x", data=["list"])  # type: ignore[arg-type]
+
+
+def test_history_created_dates_works_from_another_thread(make_env: Any) -> None:
+    # 利用状況は集計スレッドから usage() を呼ぶ(v0.2)。GUI スレッドの接続を使うと ProgrammingError になる。
+    import threading
+
+    env = make_env()
+    _record_n(env, 3)
+    env.store.add_snippet("署名", "よろしく")
+    box: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            box["dates"] = env.store.history_created_dates()
+        except Exception as e:  # noqa: BLE001
+            box["error"] = e
+
+    t = threading.Thread(target=work)
+    t.start()
+    t.join(10)
+    assert "error" not in box, box.get("error")
+    assert len(box["dates"]) == 3

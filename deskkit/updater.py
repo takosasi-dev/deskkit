@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -71,11 +72,22 @@ def _check_url(url: str) -> None:
         raise UpdateError(f"許可していない接続先です: {u.hostname}")
 
 
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """リダイレクト先を「たどる前に」検査する(http や許可リスト外のホストへは一度も接続しない)。"""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        _check_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SafeRedirect)
+
+
 def _open(url: str, timeout: float, accept: str) -> Any:
     _check_url(url)
     req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": f"DeskKit/{__version__}"})
-    resp = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 - https と接続先を上で検査済み
-    _check_url(resp.geturl())  # リダイレクト後の接続先も検査する
+    resp = _OPENER.open(req, timeout=timeout)  # https と接続先を上で検査済み。リダイレクト先も _SafeRedirect で検査
+    _check_url(resp.geturl())  # 念のため最終的な接続先も検査する
     return resp
 
 
@@ -205,8 +217,24 @@ def _file_sha(p: Path) -> str:
     return h.hexdigest()
 
 
+_RETRY_WINERRORS = {5, 32, 33}  # ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION(ウイルス対策の一時的なロック)
+
+
+def _replace(src: Path, dst: Path, tries: int = 8, delay: float = 0.25) -> None:
+    """os.replace を、ウイルス対策ソフトなどの一時的なロックの間だけ少し待って再試行する。"""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as e:
+            if i == tries - 1 or getattr(e, "winerror", None) not in _RETRY_WINERRORS:
+                raise
+            time.sleep(delay)
+
+
 def swap_in(new_exe: Path) -> Path:
-    """実行中の exe を DeskKit.previous.exe に改名し、新しい exe をその場所に置く。失敗したら元に戻す。"""
+    """実行中の exe を DeskKit.previous.exe に改名し、新しい exe をその場所に置く。失敗したら元に戻す。
+    どの失敗でも UpdateError にし、DeskKit.exe が無くなる状態を残さない(戻せないときは手順を示す)。"""
     cur = current_exe()
     if cur is None:
         raise UpdateError("開発版(python 実行)では入れ替えできません")
@@ -222,40 +250,58 @@ def swap_in(new_exe: Path) -> Path:
     try:
         if prev.exists():
             prev.unlink()  # 1世代前の自分自身の退避ファイルだけを消す
-        os.replace(cur, prev)  # 実行中の exe でも改名はできる
+        _replace(cur, prev)  # 実行中の exe でも改名はできる
     except OSError as e:
         staged.unlink(missing_ok=True)
-        raise UpdateError("今の DeskKit.exe を退避できませんでした") from e
+        raise UpdateError("今の DeskKit.exe を退避できませんでした(ウイルス対策ソフトが検査中の可能性。少し待ってからやり直してください)") from e
     try:
-        os.replace(staged, cur)
+        _replace(staged, cur)
     except OSError as e:
-        os.replace(prev, cur)
+        try:
+            _replace(prev, cur)
+        except OSError as e2:
+            # 元にも戻せない: 新しい exe(.new)と旧版(previous)は残っているので、利用者に名前の付け直しを頼む
+            raise UpdateError(f"新しい exe を置けず、元の版にも戻せませんでした。{cur.parent} の {PREVIOUS_NAME} を "
+                              f"{cur.name} に名前を変えてください") from e2
         staged.unlink(missing_ok=True)
         raise UpdateError("新しい exe を置けませんでした(元の版に戻しました)") from e
     return cur
 
 
 def swap_back() -> Path:
-    """DeskKit.previous.exe と今の exe を入れ替える(前の版に戻す)。"""
+    """DeskKit.previous.exe と今の exe を入れ替える(前の版に戻す)。
+    3段階(今→.swap、前→今、.swap→前)のうち2段階目までできれば「戻せた」とみなす(3段階目の失敗は .swap が残るだけ)。"""
     cur = current_exe()
     prev = previous_exe()
     if cur is None or prev is None:
         raise UpdateError("前の版が残っていません")
     tmp = cur.with_name(cur.name + ".swap")
     try:
-        os.replace(cur, tmp)
-        os.replace(prev, cur)
-        os.replace(tmp, prev)
+        _replace(cur, tmp)
     except OSError as e:
-        if tmp.exists() and not cur.exists():
-            os.replace(tmp, cur)
-        raise UpdateError("前の版に戻せませんでした") from e
+        raise UpdateError("前の版に戻せませんでした(今の exe を退避できません)") from e
+    try:
+        _replace(prev, cur)
+    except OSError as e:
+        try:
+            _replace(tmp, cur)
+        except OSError as e2:
+            raise UpdateError(f"前の版に戻せず、今の版も元の名前に戻せませんでした。{cur.parent} の {tmp.name} を "
+                              f"{cur.name} に名前を変えてください") from e2
+        raise UpdateError("前の版に戻せませんでした(元のままです)") from e
+    try:
+        _replace(tmp, prev)
+    except OSError:
+        pass  # DeskKit.exe は前の版になっている。.swap が残るだけ(次の swap_in / cleanup で扱う)
     return cur
 
 
 def relaunch(exe: Path, extra: list[str]) -> None:
     flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen([str(exe), "--post-update", str(os.getpid()), *extra], creationflags=flags, close_fds=True)
+    try:
+        subprocess.Popen([str(exe), "--post-update", str(os.getpid()), *extra], creationflags=flags, close_fds=True)
+    except OSError as e:
+        raise UpdateError(f"新しい DeskKit を起動できませんでした。{exe.name} を手で起動してください") from e
 
 
 def wait_for_pid_exit(pid: int, timeout_ms: int = 30000) -> None:
@@ -275,7 +321,7 @@ def wait_for_pid_exit(pid: int, timeout_ms: int = 30000) -> None:
 def cleanup_downloads(dest_dir: Path) -> None:
     if not dest_dir.exists():
         return
-    for p in dest_dir.glob("DeskKit-*.exe*"):
+    for p in [*dest_dir.glob("DeskKit-*.exe*"), *dest_dir.glob("DeskKit-*.part")]:
         try:
             p.unlink()  # 自分でダウンロードした更新ファイルだけ
         except OSError:

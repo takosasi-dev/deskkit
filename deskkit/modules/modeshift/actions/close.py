@@ -28,6 +28,40 @@ def plan(a: dict[str, Any], env: PlanEnv) -> Step:
     return step
 
 
+def _force_confirmed(exe: str, pids: set[int], env: ExecEnv) -> set[int]:
+    """確認して承認された PID を強制終了し、終わった(または既に終わっていた)PID を返す。
+    確認ダイアログは最長 10 分待つので、その間に対象が終わって PID が別のプロセスに再利用されうる。そこで確認の前に
+    ハンドルを開き(exe 名もハンドルで確かめる)、承認後は PID ではなく同じハンドルで終了させる。ハンドルは必ず閉じる。"""
+    done: set[int] = set()
+    confirm = env.confirm_force
+    if confirm is None:
+        return done
+    procs = env.backends.processes
+    for pid in sorted(pids):
+        if env.abort.is_set():
+            break
+        target = procs.open_for_force(pid, exe)
+        if target is None:
+            if pid not in set(env.pids_of(exe)):
+                done.add(pid)            # 既に終了していた(開けないが動いている昇格プロセス等は残す)
+            continue
+        try:
+            if not target.alive():
+                done.add(pid)
+                continue
+            if not confirm(exe, pid) or env.abort.is_set():
+                continue
+            if not target.alive():       # 確認を待つ間に自分で終わった
+                done.add(pid)
+                continue
+            ok, _why = target.terminate_confirmed()
+            if ok:
+                done.add(pid)
+        finally:
+            target.close()
+    return done
+
+
 def run(step: Step, env: ExecEnv) -> tuple[str, str]:
     p = step.params
     exe: str = p["exe"]
@@ -48,18 +82,7 @@ def run(step: Step, env: ExecEnv) -> tuple[str, str]:
         return STILL_RUNNING, "中断のため待機をやめた"
     # FR-14: 条件がそろったときだけ、PID ごとに確認して承認されたものだけ強制終了する
     if p.get("force_on_timeout") and env.confirm_force is not None:
-        killed: list[int] = []
-        for pid in sorted(remaining):
-            if env.abort.is_set():
-                break
-            if pid not in set(env.pids_of(exe)):
-                killed.append(pid)
-                continue
-            if env.confirm_force(exe, pid):
-                ok, _why = env.backends.processes.force_terminate_confirmed(pid)
-                if ok:
-                    killed.append(pid)
-        remaining -= set(killed)
+        remaining -= _force_confirmed(exe, remaining, env)
         if not remaining:
             return OK, "応答がなかったプロセスを確認のうえ強制終了"
     pid_txt = ", ".join(map(str, sorted(remaining)))

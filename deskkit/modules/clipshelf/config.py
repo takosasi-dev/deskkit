@@ -25,7 +25,12 @@ DEFAULTS: dict[str, Any] = {
     "time_format": "%H:%M",
     "auto_paste": "off",
     "auto_paste_deny_exes": [],
+    # v0.2: ModeShift のこのモード中は記録しない(M3)。名前で持ち、今は無いモード名も消さずに残す
+    "pause_in_modes": [],
+    # v0.2: このアプリからのコピーは minutes 分で自動的に消す(C3)。exe 名だけで判定し、内容は見ない。既定は空(オフ)
+    "short_lived": {"exes": [], "minutes": 10},
 }
+SHORT_LIVED_MAX_MINUTES = 7 * 24 * 60
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,9 @@ class Config:
     time_format: str
     auto_paste: str
     auto_paste_deny_exes: frozenset[str]
+    pause_in_modes: tuple[str, ...] = ()
+    short_lived_exes: frozenset[str] = frozenset()
+    short_lived_minutes: int = 10
 
 
 def merge_defaults(section: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -81,6 +89,18 @@ def _exe_list(key: str, value: Any) -> frozenset[str]:
     return frozenset(normalize_exe(x) for x in value if normalize_exe(x))
 
 
+def _name_list(key: str, value: Any) -> tuple[str, ...]:
+    """モード名の配列。前後の空白を除き、空と重複を落とす(順序は保つ。今は無いモード名も残す)。"""
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise ValueError(f"clipshelf.{key} はモード名の配列にしてください")
+    out: list[str] = []
+    for x in value:
+        s = x.strip()
+        if s and s not in out:
+            out.append(s)
+    return tuple(out)
+
+
 def normalize_exe(name: str) -> str:
     """exe 名の比較用表記(小文字・前後空白なし・パスはファイル名だけ)。"""
     s = name.strip().strip('"').replace("/", "\\")
@@ -105,6 +125,9 @@ def parse(section: Mapping[str, Any]) -> Config:
     for key in ("date_format", "time_format"):
         if not isinstance(sec[key], str) or not sec[key]:
             raise ValueError(f"clipshelf.{key} は空でない文字列にしてください")
+    sl = sec["short_lived"]
+    if not isinstance(sl, dict):
+        raise ValueError("clipshelf.short_lived はオブジェクトにしてください")
     return Config(
         mode=_choice("mode", sec["mode"], MODES),
         hotkeys=hotkeys,
@@ -119,4 +142,7 @@ def parse(section: Mapping[str, Any]) -> Config:
         time_format=str(sec["time_format"]),
         auto_paste=_choice("auto_paste", sec["auto_paste"], AUTO_PASTE_MODES),
         auto_paste_deny_exes=_exe_list("auto_paste_deny_exes", sec["auto_paste_deny_exes"]),
+        pause_in_modes=_name_list("pause_in_modes", sec["pause_in_modes"]),
+        short_lived_exes=_exe_list("short_lived.exes", sl.get("exes")),
+        short_lived_minutes=_int(sec, "short_lived.minutes", sl.get("minutes"), 1, SHORT_LIVED_MAX_MINUTES),
     )

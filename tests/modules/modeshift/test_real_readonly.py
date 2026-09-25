@@ -47,3 +47,32 @@ def test_real_process_list() -> None:
     me = [p for p in procs if p.pid == os.getpid()]
     assert me and me[0].exe.endswith(".exe")
     assert exe_path(os.getpid())
+
+
+def test_real_capture_theme_and_ac_read_only() -> None:
+    """v0.2: マイク(既定の録音デバイス)・テーマ(HKCU)・電源(AC/バッテリー)を読むだけ。書き込み・送信はしない。"""
+    from deskkit.modules.modeshift._win32 import ac_line_status
+    from deskkit.modules.modeshift.actions.audio import CoreAudio
+    from deskkit.modules.modeshift.actions.theme import RegistryTheme
+
+    c = CoreAudio().get_capture()
+    if c is not None:
+        assert 0.0 <= c.level <= 1.0 and isinstance(c.mute, bool) and c.device_id
+    th = RegistryTheme().get()
+    assert th.apps in ("dark", "light", None) and th.system in ("dark", "light", None)
+    assert ac_line_status() in (True, False, None)
+
+
+def test_real_force_handle_open_and_close_without_terminating() -> None:
+    """強制終了の候補ハンドルを自分自身に対して開いて閉じるだけ(terminate_confirmed は呼ばない)。"""
+    import os
+
+    from deskkit.modules.modeshift._win32 import exe_basename, exe_path, open_for_force
+
+    me = exe_path(os.getpid())
+    assert me
+    assert open_for_force(os.getpid(), "not-this.exe") is None      # exe 名がハンドルで確かめられる
+    h = open_for_force(os.getpid(), exe_basename(me))
+    assert h is not None and h.pid == os.getpid() and h.alive()
+    h.close()
+    assert not h.alive()

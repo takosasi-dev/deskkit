@@ -1,9 +1,12 @@
 # --selftest(FR-17 / AC-1)。偽の Win32Api に M-1〜M-6 を再現する固定データを入れ、計画が期待表と一致するか検査する。
 # あわせて INV-2(曖昧は動かさない)・INV-6(undo 書き込み失敗で中止)・INV-7(dry_run で SetWindowPlacement 0回)を確かめる。
+# v0.2: プリセット(v0.1 形式の移行)・自動スナップショット・新規ウィンドウの検出・副モニタのワークスペース座標も確かめる。
 # データは一時フォルダに置き、実機のウィンドウにも %LOCALAPPDATA% にも触れない。
 from __future__ import annotations
 
+import json
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,7 +14,8 @@ from . import matcher, monitors, planner, windows
 from .applier import Applier
 from .config import compile_target
 from .fake_win32 import FakeWin32, fake_monitor, fake_window
-from .model import Layout, RawMonitor, SavedEntry
+from .model import MIGRATED_PRESET_NAME, Layout, RawMonitor, SavedEntry
+from .placer import NewWindowWatcher
 from .store import Store, StoreWriteError
 
 NOTEPAD = "C:\\Windows\\notepad.exe"
@@ -151,6 +155,14 @@ def run() -> int:
               "直前の適用を元に戻し、undo.json を空にする(FR-9)")
         check(Applier(sc_live.api, store).undo("000000000000", dry_run=False).status in ("nothing", "sig_mismatch"),
               "構成が違えば取り消さない")
+        _check_presets(check, root / "presets", sc)
+    _check_placer(check)
+    # ワークスペース座標のずれはウィンドウが載っているモニタのもの(タスクバーを左に置いた副モニタ)
+    two = [fake_monitor("\\\\.\\DISPLAY1", (0, 0, 1920, 1080), primary=True, work=(0, 0, 1920, 1040)),
+           fake_monitor("\\\\.\\DISPLAY2", (1920, 0, 3840, 1080), work=(1968, 0, 3840, 1080))]
+    check(monitors.workspace_to_screen((1952, 100, 2552, 700), two) == (2000, 100, 2600, 700)
+          and monitors.screen_to_workspace((2000, 100, 2600, 700), two) == (1952, 100, 2552, 700),
+          "ワークスペース座標を副モニタ自身の作業領域で換算する")
 
     # シグネチャ: 同じ構成なら同じ値 / ID が取れなければ None
     sigs = {monitors.compute(sc.monitors, "device_interface").signature for _ in range(3)}
@@ -165,6 +177,47 @@ def run() -> int:
         _out(ln)
     _out("結果: " + ("合格" if ok else "不合格"))
     return 0 if ok else 1
+
+
+def _check_presets(check: Callable[[bool, str], None], root: Path, sc: Scenario) -> None:
+    """L1 / L2: v0.1 形式の読み込みと移行(控え)・プリセット名の検索・自動保存が利用者のプリセットに触らないこと。"""
+    store = Store(root)
+    sig = sc.layout.signature
+    p = store.layout_path(sig)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(sc.layout.to_json(), ensure_ascii=False), encoding="utf-8")
+    lay = store.load_layout(sig)
+    check(lay is not None and len(lay.windows) == len(sc.layout.windows), "v0.1 形式のレイアウトを既定のプリセットとして読む")
+    store.save_layout(sc.layout, "配信用")
+    ps = store.load_set(sig)
+    check(bool(list(p.parent.glob(f"{sig}.json.v1-backup-*"))) and ps is not None and not ps.from_v1
+          and [x.name for x in ps.presets] == [MIGRATED_PRESET_NAME, "配信用"],
+          "初めて書くとき v0.1 形式の控えを残してプリセット形式へ移行する")
+    check(store.load_layout(sig, "配信用") is not None and store.load_layout(sig, "存在しない") is None,
+          "プリセット名で探し、無い名前は見つからない(layout.apply は no_layout)")
+    before = p.read_bytes()
+    store.write_auto_latest(Layout(sig, [], "2026-09-25T10:00:00+09:00", list(sc.layout.windows[:2])))
+    store.promote_auto(sig)
+    auto = store.load_auto(sig)
+    check(p.read_bytes() == before and auto is not None and set(auto.slots) == {"latest", "before_change"},
+          "自動スナップショットは別ファイルに書き、利用者のプリセットを上書きしない")
+
+
+def _check_placer(check: Callable[[bool, str], None]) -> None:
+    """L3: 新しいウィンドウの検出は EnumWindows の差分だけ。既にある窓は扱わず、位置が落ち着いてから1回だけ返す。"""
+    api = FakeWin32(monitors=[fake_monitor("\\\\.\\DISPLAY1", (0, 0, 1920, 1080), primary=True)],
+                    windows=[fake_window(10, 10, EDIT, "EdWnd", "old")], pid=4242)
+    w = NewWindowWatcher(api, lambda raw: True)
+    w.poll_new()
+    first = w.poll_new() or bool(w.ready())
+    api.windows.append(fake_window(11, 11, EDIT, "EdWnd", "new"))
+    got: list[int] = []
+    for _ in range(3):
+        if w.poll_new():
+            for raw in w.ready():
+                got.append(raw.hwnd)
+                w.mark_handled(raw.hwnd)
+    check(not first and got == [11], "新しいウィンドウだけを1回だけ判定に回す(既存の窓は扱わない・フックなし)")
 
 
 def _out(text: str) -> None:

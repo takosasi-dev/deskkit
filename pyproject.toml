@@ -1,6 +1,6 @@
 [project]
 name = "deskkit"
-version = "0.1.0"
+version = "0.2.0"
 description = "DeskKit — PC 生活の QOL を上げる常駐ツール群(ModeShift / DropSort / LayoutKeep / ClipShelf)"
 requires-python = ">=3.11"
 dependencies = ["PySide6-Essentials>=6.6"]

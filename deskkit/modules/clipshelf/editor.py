@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -29,9 +29,13 @@ CHIPS: tuple[tuple[str, str], ...] = (
     ("{date}", "今日の日付"),
     ("{time}", "現在の時刻"),
     ("{clipboard}", "今のクリップボードのテキスト"),
+    ("{input:ラベル}", "貼り付けるときに入力する欄。{input:宛名=山田} で既定値も書けます"),
+    ("{select:A|B|C}", "貼り付けるときに選ぶ欄。選択肢を | で区切ります"),
     ("{{", "「{」の文字"),
     ("}}", "「}」の文字"),
 )
+# 挿入後に選択状態にする部分(すぐ上書きできるように): トークンの先頭 → 選択する範囲の (開始, 末尾からの文字数)
+_SELECT_AFTER_INSERT: dict[str, tuple[int, int]] = {"{input:ラベル}": (7, 1), "{select:A|B|C}": (8, 1)}
 
 
 def _chip(text: str, tip: str, accent: str) -> QPushButton:
@@ -70,18 +74,21 @@ class SnippetEditor(QWidget):
         mono.setFamilies(["Cascadia Mono", "Consolas", "BIZ UDGothic", "MS Gothic"])
         mono.setPixelSize(13)
         self.body.setFont(mono)
-        self.body.setPlaceholderText("本文。{date} {time} {clipboard} が使えます")
+        self.body.setPlaceholderText("本文。{date} {time} {clipboard} {input:ラベル} {select:A|B|C} が使えます")
         self.body.setMinimumHeight(110 if compact else 150)
         lay.addWidget(self.body)
-        chips = QHBoxLayout()
-        chips.setSpacing(6)
-        chips.addWidget(W.label("挿入:", "Mute"))
-        for text, tip in CHIPS:
-            b = _chip(text, tip, accent)
-            b.clicked.connect(lambda _=False, t=text: self._insert(t))
-            chips.addWidget(b)
-        chips.addStretch(1)
-        lay.addLayout(chips)
+        # チップは2行(差し込み・文字 / 貼り付け時に聞く欄)。狭い編集ダイアログでも横にはみ出さないように
+        for caption, group in (("挿入:", [c for c in CHIPS if c[0] not in _SELECT_AFTER_INSERT]),
+                               ("聞く欄:", [c for c in CHIPS if c[0] in _SELECT_AFTER_INSERT])):
+            chips = QHBoxLayout()
+            chips.setSpacing(6)
+            chips.addWidget(W.label(caption, "Mute"))
+            for text, tip in group:
+                b = _chip(text, tip, accent)
+                b.clicked.connect(lambda _=False, t=text: self._insert(t))
+                chips.addWidget(b)
+            chips.addStretch(1)
+            lay.addLayout(chips)
         pv = QFrame()
         pv.setObjectName("Inset")
         pl = QVBoxLayout(pv)
@@ -128,7 +135,15 @@ class SnippetEditor(QWidget):
 
     def _insert(self, token: str) -> None:
         try:
+            cur = self.body.textCursor()
+            start = cur.selectionStart()
             self.body.insertPlainText(token)
+            sel = _SELECT_AFTER_INSERT.get(token)
+            if sel is not None:
+                cur = self.body.textCursor()
+                cur.setPosition(start + sel[0])
+                cur.setPosition(start + len(token) - sel[1], QTextCursor.MoveMode.KeepAnchor)
+                self.body.setTextCursor(cur)
             self.body.setFocus()
         except Exception:  # noqa: BLE001 - シグナル処理から例外を漏らさない
             pass

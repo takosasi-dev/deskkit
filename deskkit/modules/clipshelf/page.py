@@ -1,5 +1,5 @@
 # Control Center の ClipShelf 画面。モード切替・状態・件数・直近の判定(理由コード/コピー元/時刻のみ)・定型文の管理・
-# 除外設定・ホットキー・保存上限・自動貼り付け・全消去をまとめる。履歴の本文はこの画面に出さない(本文はパレットだけ)。
+# 除外設定・短命記録・モード中の停止・ホットキー・保存上限・自動貼り付け・全消去。履歴の本文はここに出さない(パレットだけ)。
 # 設定を変える操作は即保存する。シグナルから呼ぶ処理はすべて guard で例外を握る。
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from deskkit.modules.clipshelf import policy
-from deskkit.modules.clipshelf.config import normalize_exe
+from deskkit.modules.clipshelf.config import SHORT_LIVED_MAX_MINUTES, normalize_exe
 from deskkit.modules.clipshelf.editor import SnippetEditor
 from deskkit.modules.clipshelf.module import REASON_LABELS
 from deskkit.modules.clipshelf.palette import guard
@@ -41,6 +41,7 @@ from deskkit.ui.theme import G
 if TYPE_CHECKING:
     from deskkit.modules.clipshelf.module import ClipShelfModule
 
+RETENTION_DEBOUNCE_MS = 700
 _REASON_KIND = {
     policy.RECORDED: "ok", policy.OBSERVE_ONLY: "info", policy.SELF_ORIGIN: "off", policy.DUPLICATE: "off",
 }
@@ -97,6 +98,8 @@ class ClipShelfPage(W.ScrollPage):
         self._build_decisions()
         self._build_snippets()
         self._build_exclusions()
+        self._build_short_lived()
+        self._build_mode_pause()
         self._build_hotkeys()
         self._build_retention()
         self._build_auto_paste()
@@ -373,6 +376,115 @@ class ClipShelfPage(W.ScrollPage):
         for n in chosen:
             self.excl_editor.add_value(n)
 
+    # ================================================================ 短命記録(アプリ別、C3)
+    def _build_short_lived(self) -> None:
+        cfg = self.m.config
+        card = W.Card("短命記録(アプリ別)", "指定したアプリからのコピーは記録しますが、決めた時間が過ぎると自動で消します。",
+                      G.CLOCK, self.accent)
+        card.add(_note("判定はコピー元の exe 名だけで、内容は見ません。期限は記録したときに項目ごとに決まり、"
+                       "後から設定を変えても記録済みの項目の期限は変わりません。ピン留めした項目は消しません。",
+                       T.INFO, G.INFO))
+        pick = W.button("実行中のアプリから選ぶ", "secondary", G.APP, on_click=guard(self._pick_running_short))
+        self.short_editor = W.StringListEditor(sorted(cfg.short_lived_exes), "exe 名(例: someapp.exe)", normalize_exe,
+                                               height=100, extra_buttons=[pick])
+        self.short_editor.changed.connect(guard(self._on_short_exes_changed))
+        card.add(W.SettingRow("対象のアプリ", "空なら短命記録は使いません(既定)。", None, G.APP))
+        card.add(self.short_editor)
+        self.sp_short = _spin(cfg.short_lived_minutes, 1, SHORT_LIVED_MAX_MINUTES, " 分")
+        self.sp_short.valueChanged.connect(guard(self._on_short_minutes))
+        card.add(W.SettingRow("消すまでの時間", "記録してからこの時間が過ぎたら消します(1分ごとに確認)。", self.sp_short, G.CLOCK))
+        self.short_state = W.label("", "Mute")
+        card.add(self.short_state)
+        self.add(card)
+
+    def _on_short_exes_changed(self, items: list[str]) -> None:
+        def mut(s: dict[str, Any]) -> None:
+            s.setdefault("short_lived", {})["exes"] = sorted({normalize_exe(x) for x in items if normalize_exe(x)})
+
+        self._save(mut)
+
+    def _on_short_minutes(self, v: int) -> None:
+        def mut(s: dict[str, Any]) -> None:
+            s.setdefault("short_lived", {})["minutes"] = int(v)
+
+        self._save(mut)
+
+    def _pick_running_short(self) -> None:
+        chosen = pick_exes_dialog(self._parent(), self.m.running_exe_names(), set(self.short_editor.items()), self.accent,
+                                  prompt="短命記録にしたいアプリを選んでください(複数可)。exe 名だけを保存します。")
+        for n in chosen:
+            self.short_editor.add_value(n)
+
+    # ================================================================ モード中は止める(M3)
+    def _build_mode_pause(self) -> None:
+        card = W.Card("自動で記録を止める", "ModeShift のモード中や、DeskKit のスヌーズ中は記録しません。止めた・再開したは"
+                      "通知せず、こことトレイの状態にだけ表示します。", G.PAUSE, self.accent)
+        self.mode_list = QListWidget()
+        self.mode_list.itemChanged.connect(guard(lambda _it: self._on_mode_list_changed()))
+        card.add(W.SettingRow("このモード中は記録しない", "チェックしたモードに ModeShift が切り替えたら記録を止め、"
+                              "元に戻したら再開します。", None, G.PAUSE))
+        card.add(self.mode_list)
+        self.mode_empty = W.label("ModeShift にモードがありません。ModeShift でモードを作るとここで選べます。", "Mute", wrap=True)
+        card.add(self.mode_empty)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.mode_state = W.label("", "Dim", wrap=True)
+        row.addWidget(self.mode_state, 1)
+        self.mode_clear_btn = W.button("停止を解除", "ghost", G.PLAY, on_click=guard(self._clear_mode_pause),
+                                       tooltip="ModeShift の復帰を取りこぼしたときに、モードによる停止を手で解除します")
+        row.addWidget(self.mode_clear_btn)
+        card.add_layout(row)
+        self.add(card)
+        self._reload_mode_list()
+
+    def _reload_mode_list(self) -> None:
+        chosen = list(self.m.config.pause_in_modes)
+        choices = self.m.mode_choices()
+        known = {n for n, _ in choices}
+        self.mode_list.blockSignals(True)
+        self.mode_list.clear()
+        rows = [(n, lb if lb == n else f"{lb}({n})") for n, lb in choices]
+        rows += [(n, f"{n}(ModeShift に見当たらないモード)") for n in chosen if n not in known]
+        for name, text in rows:
+            li = QListWidgetItem(text)
+            li.setData(Qt.ItemDataRole.UserRole, name)
+            li.setFlags(li.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            li.setCheckState(Qt.CheckState.Checked if name in chosen else Qt.CheckState.Unchecked)
+            self.mode_list.addItem(li)
+        self.mode_list.blockSignals(False)
+        self.mode_list.setFixedHeight(min(200, 14 + 30 * max(1, len(rows))))  # 行数に合わせる(空白を作らない)
+        self.mode_list.setVisible(bool(rows))
+        self.mode_empty.setVisible(not rows)
+
+    def _on_mode_list_changed(self) -> None:
+        names: list[str] = []
+        for i in range(self.mode_list.count()):
+            li = self.mode_list.item(i)
+            if li.checkState() == Qt.CheckState.Checked:
+                names.append(str(li.data(Qt.ItemDataRole.UserRole)))
+
+        def mut(s: dict[str, Any]) -> None:
+            s["pause_in_modes"] = names
+
+        self._save(mut)
+
+    def _clear_mode_pause(self) -> None:
+        self.m.clear_mode_pause()
+        self._flash("モードによる停止を解除しました")
+
+    def _refresh_mode_state(self) -> None:
+        m = self.m
+        mode = m.active_mode()
+        texts: list[str] = []
+        if m.mode_paused():
+            texts.append(f"今はモード「{mode}」中のため記録を止めています。")
+        elif mode:
+            texts.append(f"今のモード: {mode}(記録は止めません)")
+        if m.is_snoozed():
+            texts.append("DeskKit がスヌーズ中のため記録を止めています。")
+        self.mode_state.setText(" ".join(texts) or "今は自動で止めていません。")
+        self.mode_clear_btn.setVisible(m.mode_paused())
+
     # ================================================================ ホットキー
     def _build_hotkeys(self) -> None:
         cfg = self.m.config
@@ -410,8 +522,14 @@ class ClipShelfPage(W.ScrollPage):
         self.sp_chars = _spin(cfg.max_chars, 1, 10_000_000, " 文字")
         self.sp_debounce = _spin(cfg.debounce_ms, 0, 5000, " ms")
         self.sp_retry = _spin(cfg.open_retry, 1, 50, " 回")
-        self.sp_items.valueChanged.connect(guard(lambda v: self._save_retention("max_items", int(v))))
-        self.sp_days.valueChanged.connect(guard(lambda v: self._save_retention("max_days", int(v))))
+        # 保持上限は下げると履歴が消える。ホイールや押し間違いで即削除しないよう、値が落ち着いてから(RETENTION_DEBOUNCE_MS)
+        # まとめて判定し、消える件数があれば確認する(取消で元の値に戻す)。本体のホイール対策には頼らない。
+        self._ret_timer = QTimer(self)
+        self._ret_timer.setSingleShot(True)
+        self._ret_timer.setInterval(RETENTION_DEBOUNCE_MS)
+        self._ret_timer.timeout.connect(guard(self._apply_retention))
+        self.sp_items.valueChanged.connect(guard(lambda _v: self._ret_timer.start()))
+        self.sp_days.valueChanged.connect(guard(lambda _v: self._ret_timer.start()))
         self.sp_chars.valueChanged.connect(guard(lambda v: self._save_simple("max_chars", int(v))))
         self.sp_debounce.valueChanged.connect(guard(lambda v: self._save_simple("debounce_ms", int(v))))
         self.sp_retry.valueChanged.connect(guard(lambda v: self._save_simple("open_retry", int(v))))
@@ -443,12 +561,38 @@ class ClipShelfPage(W.ScrollPage):
         card.add(W.label("strftime 形式(例: %Y-%m-%d、%H:%M、%Y年%m月%d日)。", "Mute"))
         self.add(card)
 
-    def _save_retention(self, key: str, value: int) -> None:
+    def _apply_retention(self) -> None:
+        """保持上限のスピンボックスの値が落ち着いたら呼ばれる。消える履歴があれば件数を示して確認する。"""
+        self._ret_timer.stop()
+        cfg = self.m.config
+        items, days = int(self.sp_items.value()), int(self.sp_days.value())
+        if (items, days) == (cfg.max_items, cfg.max_days):
+            return
+        n = self.m.retention_preview(items, days)
+        if n > 0:
+            ok, _ = W.confirm(self._parent(), "保持の上限を下げる",
+                              f"この上限にすると、今ある履歴のうち {n:,} 件(ピン以外の古い順)がすぐに削除されます。"
+                              "元に戻せません。", ok_text=f"{n:,} 件を削除して保存", danger=True)
+            if not ok:
+                self._revert_retention()
+                return
+
         def mut(s: dict[str, Any]) -> None:
-            s.setdefault("retention", {})[key] = value
+            r = s.setdefault("retention", {})
+            r["max_items"] = items
+            r["max_days"] = days
 
         if self._save(mut):
             self.m.monitor.trim(self.m.config)
+        else:
+            self._revert_retention()
+
+    def _revert_retention(self) -> None:
+        cfg = self.m.config
+        for sp, v in ((self.sp_items, cfg.max_items), (self.sp_days, cfg.max_days)):
+            sp.blockSignals(True)
+            sp.setValue(v)
+            sp.blockSignals(False)
 
     def _save_simple(self, key: str, value: Any) -> None:
         def mut(s: dict[str, Any]) -> None:
@@ -549,13 +693,24 @@ class ClipShelfPage(W.ScrollPage):
             self.mode_pill.set_state("warn", "観察モード(記録しない)")
         else:
             self.mode_pill.set_state("ok", "記録中")
-        self.pause_pill.setVisible(m.paused)
-        self.store_pill.setVisible(m.store is None)
+        reasons = m.pause_reasons()
+        if reasons:
+            self.pause_pill.set_state("off", m.status_text())
+        self.pause_pill.setVisible(bool(reasons))
+        self._refresh_mode_state()
+        n_short = m.store.short_lived_count() if m.store is not None else 0
+        self.short_state.setText(f"自動で消える予定の履歴: {n_short:,} 件" if n_short else "")
+        self.short_state.setVisible(bool(n_short))
         if m.store is None:
+            self.store_pill.set_state("error", "DB エラー")
             self.store_pill.setToolTip(m.store_error or "")
+            self.store_pill.setVisible(True)
         elif c["undecryptable"]:
             self.store_pill.set_state("warn", f"復号できない行 {c['undecryptable']} 件")
+            self.store_pill.setToolTip("履歴の分は全消去で削除できます(定型文の分は残ります)")
             self.store_pill.setVisible(True)
+        else:
+            self.store_pill.setVisible(False)  # 全消去で復号できない行が無くなったら警告を消す
         if self.mode_seg.value() != m.config.mode:
             self.mode_seg.set_value(m.config.mode)
         if self.pause_toggle.isChecked() != m.paused:
@@ -607,9 +762,10 @@ class ClipShelfPage(W.ScrollPage):
 
 
 # ------------------------------------------------------------------ 実行中アプリから選ぶダイアログ
-def pick_exes_dialog(parent: QWidget | None, names: list[str], already: set[str], accent: str) -> list[str]:
+def pick_exes_dialog(parent: QWidget | None, names: list[str], already: set[str], accent: str,
+                     prompt: str = "除外したいアプリを選んでください(複数可)。exe 名だけを保存します。") -> list[str]:
     dlg = W.StyledDialog(parent, "実行中のアプリから選ぶ", G.APP, accent, width=460)
-    dlg.body.addWidget(W.label("除外したいアプリを選んでください(複数可)。exe 名だけを保存します。", "Dim", wrap=True))
+    dlg.body.addWidget(W.label(prompt, "Dim", wrap=True))
     flt = QLineEdit()
     flt.setPlaceholderText("絞り込み")
     dlg.body.addWidget(flt)

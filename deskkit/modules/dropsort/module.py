@@ -1,11 +1,12 @@
 # host との結合: 設定の読み込みと既定値の補完、監視スレッド・定期フルスキャン・作業スレッドの管理、
-# トレイ項目・通知(保留つき)・ホットキー・CLI 転送・Control Center の画面生成。
-# 重い処理(スキャン・移動・undo)は作業スレッド1本で順に行い、結果は ctx.call_soon でメインスレッドへ渡す。
+# トレイ項目・通知(保留つき)・ホットキー・CLI 転送・Control Center の画面生成・スヌーズとモード連携の停止。
+# 重い処理(スキャン・移動・undo・CLI・ルールの実績集計)は作業スレッド1本で順に行い、結果は ctx.call_soon で返す。
 from __future__ import annotations
 
 import concurrent.futures as cf
 import dataclasses
 import ntpath
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -15,8 +16,13 @@ from deskkit.modules.dropsort.config import Config, ConfigError, fill_defaults, 
 from deskkit.modules.dropsort.notifier import Notifier
 from deskkit.modules.dropsort.oplog import LockBusyError
 from deskkit.modules.dropsort.service import BatchResult, CycleResult, DropSortService, UndoResult, reason_text
+from deskkit.modules.dropsort.stats import RuleStats
 
 TITLE = "DropSort"
+# stop() が作業スレッドを待つ上限(秒)。ファイル1件の移動の途中では止めない(打ち切らない)ので、
+# 別ドライブへの大きなコピー中などで上限を超えたら待つのをやめて戻り、作業スレッドはその1件を終えてから止まる。
+STOP_WAIT_S = 5.0
+CLI_LOCK_TIMEOUT_S = 10.0
 
 
 class DropSortModule:
@@ -39,6 +45,8 @@ class DropSortModule:
         self.service = DropSortService(api, ctx.data_dir, self.cfg, clock=clock, log=ctx.log)
         self.notifier = Notifier(ctx)
         self._executor: cf.ThreadPoolExecutor | None = None
+        self._inflight: set[cf.Future[Any]] = set()
+        self._inflight_mu = threading.Lock()
         self._watcher: Any = None
         self._watch_dead: str | None = None
         self._scan_running = False
@@ -51,10 +59,15 @@ class DropSortModule:
         self.last_cycle: CycleResult | None = None
         self.hotkey_ok: bool | None = None
         self._page_request: tuple[str, str | None] | None = None
+        self._manual_kick = False
+        self._current_mode: str | None = None   # modeshift.switched で知った今のモード(reverted で None)
+        self._stats_cache: tuple[tuple[Any, ...], dict[str, RuleStats]] | None = None
+        self._stats_waiters: list[Callable[[dict[str, RuleStats]], None]] | None = None
 
     # ------------------------------------------------------------ 起動・停止
     def start(self) -> None:
         self._running = True
+        self.service.cancel.clear()
         self._executor = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="dropsort")
         self._build_tray()
         self._build_quick_actions()
@@ -69,24 +82,32 @@ class DropSortModule:
         self._timers["debounce"].stop()
         self._timers["follow"] = self.ctx.start_timer(1000, self._kick, single_shot=True)
         self._timers["follow"].stop()
+        self._subscribe()
         self.service.resolve()
         self._ensure_watcher()
         self._update_status()
         self.request_scan(0)
 
     def stop(self) -> None:
+        """停止を要求し、作業スレッドを最大 STOP_WAIT_S 秒だけ待つ(メインスレッドを長く止めない)。
+        処理中のファイル1件は最後まで終える(途中で打ち切らない)。残りのファイルは次の起動時のスキャンで扱う。"""
         self._running = False
+        self.service.cancel.set()
         self._stop_watcher()
         ex, self._executor = self._executor, None
-        if ex is not None:
-            ex.shutdown(wait=True, cancel_futures=True)
+        if ex is None:
+            return
+        ex.shutdown(wait=False, cancel_futures=True)
+        with self._inflight_mu:
+            busy = [f for f in self._inflight if not f.done()]
+        if busy:
+            _done, not_done = cf.wait(busy, timeout=STOP_WAIT_S)
+            if not_done:
+                self.ctx.log.warning("作業スレッドが %.0f 秒で終わりませんでした。処理中の1件を終えてから止まります",
+                                     STOP_WAIT_S)
 
     # ------------------------------------------------------------ 作業スレッド
-    def _submit(self, fn: Callable[[], Any], done: Callable[[Any], None] | None = None) -> bool:
-        ex = self._executor
-        if ex is None:
-            return False
-
+    def _job(self, fn: Callable[[], Any]) -> Callable[[], Any]:
         def job() -> Any:
             try:
                 return fn()
@@ -94,10 +115,56 @@ class DropSortModule:
                 self.ctx.log.exception("作業スレッドで例外")
                 return e
 
-        fut = ex.submit(job)
+        return job
+
+    def _track(self, fut: cf.Future[Any]) -> None:
+        def forget(f: cf.Future[Any]) -> None:
+            with self._inflight_mu:
+                self._inflight.discard(f)
+
+        with self._inflight_mu:
+            self._inflight.add(fut)
+        fut.add_done_callback(forget)
+
+    def _submit(self, fn: Callable[[], Any], done: Callable[[Any], None] | None = None) -> bool:
+        ex = self._executor
+        if ex is None:
+            return False
+        try:
+            fut = ex.submit(self._job(fn))
+        except RuntimeError:  # 停止処理と行き違い
+            return False
+        self._track(fut)
         if done is not None:
             fut.add_done_callback(lambda f: self.ctx.call_soon(lambda: done(f.result()) if not f.cancelled() else None))
         return True
+
+    def run_blocking(self, fn: Callable[[], Any]) -> Any:
+        """CLI 用: 作業スレッドで fn を実行して結果を待つ。メインスレッドならローカルのイベントループを回し、
+        待つ間もトレイ・ホットキー・他モジュールを止めない。例外は結果として返す。"""
+        ex = self._executor
+        fut: cf.Future[Any] | None = None
+        if ex is not None:
+            try:
+                fut = ex.submit(self._job(fn))
+            except RuntimeError:
+                fut = None
+        if fut is None:
+            return self._job(fn)()  # 停止中(作業スレッドが無い): その場で実行する
+        self._track(fut)
+        from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
+
+        if QCoreApplication.instance() is None or threading.current_thread() is not threading.main_thread():
+            return fut.result()
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.setInterval(30)
+        timer.timeout.connect(lambda: loop.quit() if fut.done() else None)
+        timer.start()
+        if not fut.done():
+            loop.exec()
+        timer.stop()
+        return fut.result()
 
     # ------------------------------------------------------------ 監視
     def _ensure_watcher(self) -> None:
@@ -143,22 +210,30 @@ class DropSortModule:
         return "リアルタイム監視"
 
     # ------------------------------------------------------------ スキャン
-    def request_scan(self, delay_ms: int = 600) -> None:
+    def request_scan(self, delay_ms: int = 600, *, manual: bool = False) -> None:
+        """manual=True は利用者が押した「今すぐスキャン」。スヌーズ・モード連携の停止中でも1回動かす(契約 §1)。"""
         if not self._running:
             return
         t = self._timers.get("debounce")
         if t is None:
             return
+        if manual:
+            self._manual_kick = True
         t.start(max(0, int(delay_ms)))
 
     def _kick(self) -> None:
         if not self._running:
             return
+        manual, self._manual_kick = self._manual_kick, False
         if self.cfg.paused:
             self._update_status()
             return
+        if not manual and self.auto_blocked() is not None:
+            self._update_status()  # スヌーズ・モード中: 自動の整理はしない(再開時にフルスキャン)
+            return
         if self._scan_running:
             self._rescan = True
+            self._manual_kick = self._manual_kick or manual  # 手動の要求は次の1回に持ち越す
             return
         self._scan_running = True
         if not self._submit(self.service.run_cycle, self._on_cycle):
@@ -230,6 +305,11 @@ class DropSortModule:
             return "ダウンロードフォルダを解決できません"
         if self.cfg.paused:
             return "一時停止中"
+        blocked = self.auto_blocked()
+        if blocked == "mode":
+            return f"モード「{self.mode_label(self._current_mode)}」中は自動の整理を止めています"
+        if blocked == "snooze":
+            return "スヌーズ中は自動の整理を止めています"
         snap = self.service.get_snapshot()
         parts = ["監視中" if self.cfg.watch_mode == "rdcw" and not self._watch_dead else "定期スキャン中"]
         try:
@@ -258,7 +338,7 @@ class DropSortModule:
         self._tray["undo"] = self.ctx.add_tray_action("直前の1件を元に戻す", lambda: self.undo(1))
         self._tray["dry"] = self.ctx.add_tray_action("試運転の結果を見る…", self.show_dryrun_dialog)
         self.ctx.add_tray_separator()
-        self._tray["scan"] = self.ctx.add_tray_action("今すぐスキャン", lambda: self.request_scan(0))
+        self._tray["scan"] = self.ctx.add_tray_action("今すぐスキャン", lambda: self.request_scan(0, manual=True))
 
     def _build_quick_actions(self) -> None:
         """トレイに無い操作だけをクイックアクションに足す(トレイ項目は host が自動で候補に入れる)。"""
@@ -340,6 +420,7 @@ class DropSortModule:
         old = self.cfg
         self.cfg = cfg
         self.service.set_config(cfg)
+        self._stats_cache = None
         if cfg.full_scan_interval_s != old.full_scan_interval_s and "full" in self._timers:
             self._timers["full"].setInterval(int(cfg.full_scan_interval_s * 1000))
         self._update_status()
@@ -363,6 +444,163 @@ class DropSortModule:
         if not paused:
             self.request_scan(0)
         self._fire_listeners()
+
+    # ------------------------------------------------------------ スヌーズ・モード連携(契約 §1・§2)
+    def _subscribe(self) -> None:
+        on = getattr(self.ctx, "on", None)
+        if on is None:
+            return
+        on("modeshift.switched", self._on_mode_switched)
+        on("modeshift.reverted", self._on_mode_reverted)
+        on("host.snooze_changed", self._on_snooze_changed)
+
+    def snoozed(self) -> bool:
+        fn = getattr(self.ctx, "is_snoozed", None)
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001 - 判定できなければ止めない側に倒す(利用者の一時停止は別にある)
+            return False
+
+    def list_modes(self) -> list[tuple[str, str]]:
+        fn = getattr(self.ctx, "list_modes", None)
+        if fn is None:
+            return []
+        try:
+            return [(str(n), str(lb)) for n, lb in fn()]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def mode_label(self, name: str | None) -> str:
+        if not name:
+            return ""
+        return next((lb for n, lb in self.list_modes() if n == name and lb), name)
+
+    @property
+    def mode_paused(self) -> str | None:
+        """今のモードが pause_in_modes に入っていればそのモード名。"""
+        m = self._current_mode
+        return m if m is not None and m in self.cfg.pause_in_modes else None
+
+    def auto_blocked(self) -> str | None:
+        """自動の整理を止めている理由コード: user(一時停止) / mode / snooze。動いていれば None。"""
+        if self.cfg.paused:
+            return "user"
+        if self.mode_paused is not None:
+            return "mode"
+        if self.snoozed():
+            return "snooze"
+        return None
+
+    def _resumed(self, was: str | None) -> None:
+        """止まっていたのが動けるようになったらフルスキャンする(判断は実状態から行うので取りこぼさない)。通知はしない。"""
+        if was is not None and self.auto_blocked() is None:
+            self.request_scan(0)
+        self._update_status()
+        self._fire_listeners()
+
+    def _on_mode_switched(self, payload: Any) -> None:
+        mode = payload.get("mode") if hasattr(payload, "get") else None
+        if not isinstance(mode, str):
+            return
+        was = self.auto_blocked()
+        self._current_mode = mode
+        self._resumed(was)
+
+    def _on_mode_reverted(self, payload: Any) -> None:
+        was = self.auto_blocked()
+        self._current_mode = None
+        self._resumed(was)
+
+    def _on_snooze_changed(self, payload: Any) -> None:
+        snoozed = payload.get("snoozed") if hasattr(payload, "get") else None
+        if snoozed is False:
+            self._resumed("snooze")
+        else:
+            self._update_status()
+            self._fire_listeners()
+
+    # ------------------------------------------------------------ ルールの実績(D3)
+    def _stats_key(self) -> tuple[Any, ...]:
+        key: list[Any] = [int(self.service.clock() // 3600)]
+        for p in (self.service.oplog.path, self.service.dryrun.path):
+            try:
+                st = p.stat()
+                key += [st.st_size, st.st_mtime_ns]
+            except OSError:
+                key += [0, 0]
+        return tuple(key)
+
+    def rule_stats(self, done: Callable[[dict[str, RuleStats]], None]) -> None:
+        """ルールごとの実績。ログが変わっていなければキャッシュをすぐ返し、変わっていれば作業スレッドで数える。"""
+        key = self._stats_key()
+        c = self._stats_cache
+        if c is not None and c[0] == key:
+            done(c[1])
+            return
+        if self._stats_waiters is not None:
+            self._stats_waiters.append(done)
+            return
+        self._stats_waiters = [done]
+        from deskkit.modules.dropsort import stats
+
+        now = self.service.clock()
+
+        def after(r: Any) -> None:
+            waiters, self._stats_waiters = self._stats_waiters or [], None
+            if isinstance(r, Exception):
+                return
+            self._stats_cache = (key, r)
+            for w in waiters:
+                w(r)
+
+        if not self._submit(lambda: stats.compute(self.service.oplog.path, self.service.dryrun.path, now), after):
+            self._stats_waiters = None
+
+    # ------------------------------------------------------------ 診断(契約 §1)
+    def diagnostics(self) -> dict[str, str | int | bool]:
+        """診断レポート用の要約。件数・モード・真偽・理由コードだけ(パス・ファイル名・URL・モード名は入れない)。"""
+        rules = self.cfg.rules
+        n_apply = sum(1 for r in rules if r.apply and r.error is None)
+        checks = self.service.rule_checks
+        n_invalid = sum(1 for r in rules if r.error is not None
+                        or (r.index in checks and not checks[r.index].ok and not checks[r.index].unavailable))
+        snap = self.service.get_snapshot()
+        if not rules:
+            mode = "none"
+        elif n_apply == 0:
+            mode = "dry-run"
+        elif n_apply == len(rules):
+            mode = "apply"
+        else:
+            mode = "mixed"
+        watch = "poll" if self.cfg.watch_mode == "poll" else ("poll_fallback" if self._watch_dead else "rdcw")
+        try:
+            today = self.service.today_counts()
+            moved_today = today["move"] + today["archive"]
+        except OSError:
+            moved_today = -1
+        return {
+            "running": self._running,
+            "downloads_resolved": self.service.downloads is not None,
+            "rules_mode": mode,
+            "rules_total": len(rules),
+            "rules_apply": n_apply,
+            "rules_dry_run": sum(1 for r in rules if not r.apply and r.error is None),
+            "rules_invalid": n_invalid,
+            "rules_template": sum(1 for r in rules if r.is_template),
+            "watch": watch,
+            "paused": self.auto_blocked() is not None,
+            "paused_reason": self.auto_blocked() or "none",
+            "pause_in_modes": len(self.cfg.pause_in_modes),
+            "pending": int(snap.get("pending") or 0),
+            "flagged": int(snap.get("flagged") or 0),
+            "dry_run_present": int(snap.get("dryrun_present") or 0),
+            "moved_today": moved_today,
+            "archive_enabled": self.cfg.archive.enabled,
+            "archive_mode": self.cfg.archive.mode,
+        }
 
     # ------------------------------------------------------------ 明示操作(作業スレッドで実行)
     def undo(self, count: int, done: Callable[[UndoResult | Exception], None] | None = None) -> None:
@@ -476,10 +714,15 @@ class DropSortModule:
 
     # ------------------------------------------------------------ CLI(host 経由)
     def handle_cli(self, args: list[str]) -> tuple[int, str]:
-        code, text = run_command(self.service, list(args), lock_timeout=10.0)
+        """移動・コピー・ロック待ちを含むので作業スレッドで実行し、終わってから結果を返す(IPC の応答は完了後)。"""
+        argv = list(args)
+        res = self.run_blocking(lambda: run_command(self.service, argv, lock_timeout=CLI_LOCK_TIMEOUT_S))
+        if isinstance(res, Exception):
+            raise res
+        code, text = res
         self._update_status()
         self._fire_listeners()
-        return code, text
+        return int(code), str(text)
 
 
 __all__ = ["DropSortModule", "ConfigError"]

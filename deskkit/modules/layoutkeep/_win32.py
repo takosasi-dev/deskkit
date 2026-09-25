@@ -20,6 +20,7 @@ class Win32Api(Protocol):
     def is_window(self, hwnd: int) -> bool: ...
     def foreground_window(self) -> int: ...
     def current_pid(self) -> int: ...
+    def is_elevated(self, pid: int) -> bool | None: ...  # 読めなければ None(昇格とみなして動かさない)
 
 
 # ---------------------------------------------------------------- 定数(Windows SDK のヘッダ値)
@@ -37,6 +38,8 @@ DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2
 ERROR_SUCCESS = 0
 ERROR_INSUFFICIENT_BUFFER = 122
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TOKEN_QUERY = 0x0008
+TOKEN_ELEVATION_CLASS = 20  # TOKEN_INFORMATION_CLASS.TokenElevation
 
 
 # ---------------------------------------------------------------- 構造体
@@ -129,7 +132,8 @@ class RealWin32:
     def __init__(self) -> None:
         u = ctypes.WinDLL("user32", use_last_error=True)
         k = ctypes.WinDLL("kernel32", use_last_error=True)
-        self._u, self._k = u, k
+        a = ctypes.WinDLL("advapi32", use_last_error=True)
+        self._u, self._k, self._a = u, k, a
         try:
             self._dwm: ctypes.WinDLL | None = ctypes.WinDLL("dwmapi", use_last_error=True)
         except OSError:
@@ -193,6 +197,10 @@ class RealWin32:
         k.GetProcessTimes.argtypes = [w.HANDLE, ctypes.POINTER(w.FILETIME), ctypes.POINTER(w.FILETIME),
                                       ctypes.POINTER(w.FILETIME), ctypes.POINTER(w.FILETIME)]
         k.GetProcessTimes.restype = w.BOOL
+        a.OpenProcessToken.argtypes = [w.HANDLE, w.DWORD, ctypes.POINTER(w.HANDLE)]
+        a.OpenProcessToken.restype = w.BOOL
+        a.GetTokenInformation.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD)]
+        a.GetTokenInformation.restype = w.BOOL
 
         if self._dwm is not None:
             self._dwm.DwmGetWindowAttribute.argtypes = [w.HWND, w.DWORD, ctypes.c_void_p, w.DWORD]
@@ -396,3 +404,26 @@ class RealWin32:
 
     def current_pid(self) -> int:
         return os.getpid()
+
+    def is_elevated(self, pid: int) -> bool | None:
+        """プロセスのトークンが昇格しているか。開けない・読めないなら None(読むだけ。権限は変えない)。"""
+        if pid <= 0:
+            return None
+        h = self._k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return None
+        try:
+            tok = w.HANDLE()
+            if not self._a.OpenProcessToken(h, TOKEN_QUERY, ctypes.byref(tok)):
+                return None
+            try:
+                val = w.DWORD()
+                ret = w.DWORD()
+                if not self._a.GetTokenInformation(tok, TOKEN_ELEVATION_CLASS, ctypes.byref(val), ctypes.sizeof(val),
+                                                   ctypes.byref(ret)):
+                    return None
+                return bool(val.value)
+            finally:
+                self._k.CloseHandle(tok)
+        finally:
+            self._k.CloseHandle(h)

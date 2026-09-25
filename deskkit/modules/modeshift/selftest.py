@@ -10,6 +10,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from deskkit.modules.modeshift import cli
+from deskkit.modules.modeshift.autoswitch import PBT_APMPOWERSTATUSCHANGE, PowerSourceWatcher
+from deskkit.modules.modeshift.config import validate_section
 from deskkit.modules.modeshift.fakes import GUID_A, GUID_B, FakeCtx, FakeUi, fake_system, populate, sample_section
 from deskkit.modules.modeshift.service import ModeShiftService
 
@@ -67,7 +69,8 @@ def run(quiet: bool = False) -> int:
         check(len(rows) == 8 and all(r["dry_run"] is True for r in rows), "ops.jsonl に dry_run: true の 8 行だけ")
         check(sysm.power.active == GUID_A and sysm.audio.master == master_before and not sysm.launcher.launched
               and not sysm.opener.opened and not sysm.procs.posted, "何も変わらない")
-        check("secret" not in ops.read_text(encoding="utf-8"), "URL のクエリをログに書かない(INV-11)")
+        check("secret" not in ops.read_text(encoding="utf-8") and "/page" not in ops.read_text(encoding="utf-8"),
+              "URL はドメインだけをログに書く(パス・クエリを書かない)")
 
         out("[4] 3つの入口で同じ Plan(AC-5)")
         sig_cli = svc.make_plan(cfg.mode("game"), source="cli", dry_run=True, in_game=False).signature()  # type: ignore[arg-type]
@@ -136,6 +139,43 @@ def run(quiet: bool = False) -> int:
         check(code == 2, "無いモードは 2")
         code, _ = cli.handle(svc, ["--bogus"])
         check(code == 1, "解釈できない引数は 1")
+
+        out("[8] v0.2: マイク・テーマ・元に戻したことの通知(modeshift.reverted)")
+        sec = ctx.settings_dict()
+        sec["modes"].append({"name": "focus", "label": "集中", "actions": [
+            {"type": "mic_volume", "level": None, "mute": True}, {"type": "theme", "apps": "dark", "system": None}]})
+        ctx.write_settings(sec)
+        svc.reload()
+        code, text = cli.handle(svc, ["focus", "--dry-run"])
+        check(code == 0 and "マイク" in text and "アプリのテーマ" in text and not sysm.audio.capture_calls
+              and not sysm.theme.set_calls, "dry-run に新しい種別が出て、何も変わらない")
+        svc.switch_mode("focus", dry_run=False, source="tray")
+        check(bool(ui.previews) and ui.previews[-1].mode == "focus", "未確認なのでプレビュー")
+        svc.execute_from_preview(ui.previews[-1])
+        check(sysm.audio.capture is not None and sysm.audio.capture.mute and sysm.theme.state.apps == "dark",
+              "マイクをミュートし、アプリをダークに")
+        n_rev = sum(1 for e, _p in ctx.emitted if e == "modeshift.reverted")
+        code, _ = cli.handle(svc, ["--undo"])
+        check(code == 0 and sysm.audio.capture is not None and not sysm.audio.capture.mute
+              and sysm.theme.state.apps == "light", "元に戻すでマイクとテーマが戻る")
+        rev = [p for e, p in ctx.emitted if e == "modeshift.reverted"]
+        check(len(rev) == n_rev + 1 and rev[-1]["mode"] == "focus", "modeshift.reverted を1回送信(戻す前のモード名)")
+
+        out("[9] v0.2: 電源のきっかけ(AC → バッテリー → AC)")
+        sec = ctx.settings_dict()
+        sec["auto_switch"] = {"enabled": True, "poll_interval_s": None,
+                              "rules": [{"trigger": "on_battery", "mode": "study", "on_exit": "undo"}]}
+        cfg2 = validate_section(sec, ctx.game_processes())
+        check(cfg2.auto_power_active and cfg2.auto_error is None, "電源のルールは間隔の設定なしで有効")
+        fired: list[str] = []
+        sysm.power.ac = True
+        watch = PowerSourceWatcher(sysm.power.ac_online, cfg2.rules, lambda r: fired.append("apply " + r.mode),
+                                   lambda r: fired.append("undo " + r.mode))
+        sysm.power.ac = False
+        watch.handle(PBT_APMPOWERSTATUSCHANGE, 0)
+        sysm.power.ac = True
+        watch.handle(PBT_APMPOWERSTATUSCHANGE, 0)
+        check(fired == ["apply study", "undo study"], "バッテリーで適用、AC に戻って元に戻す")
 
     out("selftest: " + ("合格" if not failures else f"不合格 {len(failures)} 件"))
     return 0 if not failures else 1

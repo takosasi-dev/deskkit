@@ -107,6 +107,51 @@ def run_host() -> int:
     _check(results, "AC-13 構文エラーでも動き続け、ファイルを書き換えない",
            p.stat().st_mtime_ns == mtime and host.loader.slots["_selftest_ok"].state == "running")
 
+    # ---- v0.2(docs/INTERFACES_v0.2.md)
+    from deskkit.events import REGISTERED_EVENTS
+
+    _check(results, "v0.2 イベント modeshift.reverted / host.snooze_changed が登録済み",
+           {"modeshift.reverted", "host.snooze_changed"} <= REGISTERED_EVENTS)
+    ctx = host.loader.slots["_selftest_ok"].ctx
+    snooze_got: list[dict[str, object]] = []
+    host.events.on("_selftest_ok", "host.snooze_changed", lambda pl: snooze_got.append(dict(pl)))
+    before_snooze = ctx.is_snoozed() if ctx is not None else None
+    host.snooze_for(30)
+    during = ctx.is_snoozed() if ctx is not None else None
+    host.resume()
+    after_snooze = ctx.is_snoozed() if ctx is not None else None
+    _check(results, "H2 ctx.is_snoozed() が一時停止に追従", (before_snooze, during, after_snooze) == (False, True, False),
+           f"{before_snooze}/{during}/{after_snooze}")
+    _check(results, "H2 host.snooze_changed を送る", [bool(x.get("snoozed")) for x in snooze_got] == [True, False], str(snooze_got))
+    _check(results, "ctx.list_modes() が list を返す", ctx is not None and ctx.list_modes() == [])
+
+    shown: list[str] = []
+    real_busy, real_show = host._foreground_busy, host._show_note
+    host._foreground_busy = lambda: True  # type: ignore[method-assign]
+    host._show_note = lambda n: shown.append(n.title)  # type: ignore[method-assign]
+    try:
+        host.notify("host", "保留テスト1", "", None)
+        host.notify("host", "保留テスト2", "", None)
+        host.notify("host", "エラーはすぐ", "", None, level="error")
+        held_ok = shown == ["エラーはすぐ"] and host.hold.count == 2
+        host._foreground_busy = lambda: False  # type: ignore[method-assign]
+        host.hold._tick()
+        _check(results, "H1 ゲーム・全画面中は error 以外を保留し、まとめて出す",
+               held_ok and shown[-1] == "保留中の通知 2 件", str(shown))
+    finally:
+        host._foreground_busy, host._show_note = real_busy, real_show  # type: ignore[method-assign]
+
+    p.write_text(json.dumps(settings), encoding="utf-8")  # 構文エラーの検査で壊したファイルを戻す
+    n_before = len(host.snapshots.list())
+    host.settings.write_game_processes(["selftest-game.exe", "selftest-2.exe"])
+    host.snapshot_now()
+    _check(results, "H3 設定を書くと世代が増える", len(host.snapshots.list()) == n_before + 1,
+           f"{n_before} -> {len(host.snapshots.list())}")
+    rep = host.diagnostics_report()
+    home_s = str(Path.home()).lower()
+    _check(results, "H4 診断レポートにユーザーのフォルダを含めない", "診断レポート" in rep and home_s not in rep.lower()
+           and tmp.lower() not in rep.lower())
+
     from deskkit.hotkeys import format_hotkey, parse_hotkey
 
     _check(results, "ホットキー表記の往復", format_hotkey(*parse_hotkey("ctrl+shift+space")) == "Ctrl+Shift+Space")

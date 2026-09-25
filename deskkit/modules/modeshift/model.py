@@ -11,6 +11,7 @@ from typing import Any
 ACTION_TYPES: tuple[str, ...] = (
     "launch_app", "close_app", "power_plan", "master_volume",
     "app_volume", "open_path", "open_url", "layout_apply",
+    "mic_volume", "theme",          # v0.2 で追加(docs/v0.2/modeshift.md)
 )
 
 TYPE_LABELS: dict[str, str] = {
@@ -22,12 +23,15 @@ TYPE_LABELS: dict[str, str] = {
     "open_path": "フォルダを開く",
     "open_url": "URL を開く",
     "layout_apply": "配置を適用",
+    "mic_volume": "マイク",
+    "theme": "アプリのテーマ",
 }
 
 # フォーカスを奪う/ウィンドウに作用するため、ゲーム中はスキップする種別(D-10)
-FOCUS_TYPES: frozenset[str] = frozenset({"launch_app", "close_app", "open_path", "open_url"})
-# 「元に戻す」の対象になる種別(D-5)
-UNDOABLE_TYPES: frozenset[str] = frozenset({"power_plan", "master_volume", "app_volume"})
+# theme は WM_SETTINGCHANGE を全ウィンドウ(前面のゲームを含む)へ送るため、ゲーム中は同じくスキップする(C-4)
+FOCUS_TYPES: frozenset[str] = frozenset({"launch_app", "close_app", "open_path", "open_url", "theme"})
+# 「元に戻す」の対象になる種別(D-5。v0.2 でマイクとテーマを追加。どちらも値として読んで書き戻せる)
+UNDOABLE_TYPES: frozenset[str] = frozenset({"power_plan", "master_volume", "app_volume", "mic_volume", "theme"})
 
 # Step の結果
 OK, SKIPPED, FAILED, STILL_RUNNING, ABORTED = "ok", "skipped", "failed", "still_running", "aborted"

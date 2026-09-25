@@ -3,9 +3,10 @@
 # 本文を扱うのはメモリ上とパレットの表示だけ。ログ・通知・ops.jsonl には理由コード・exe 名・ID・件数しか出さない。
 from __future__ import annotations
 
+import json
 import logging
 from collections import Counter, deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -13,7 +14,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from deskkit.catalog import info
 from deskkit.modules.clipshelf import config as cfgmod
-from deskkit.modules.clipshelf import policy, search, snippets
+from deskkit.modules.clipshelf import policy, search, snippets, transforms
 from deskkit.modules.clipshelf._win32 import WM_CLIPBOARDUPDATE, RealWin32, Win32Api
 from deskkit.modules.clipshelf.crypto import Cipher, CryptoError, DpapiCipher
 from deskkit.modules.clipshelf.monitor import ClipMonitor, Decision
@@ -31,6 +32,17 @@ if TYPE_CHECKING:
     from deskkit.modules.clipshelf.palette import Palette
 
 CLIPBOARD_MARKER = "〔クリップボードの内容〕"
+# 記録を止めている理由(診断・画面用の理由コード。§9.4 の判定理由とは別。判定理由はどれも paused になる)
+PAUSE_MANUAL = "manual"     # 利用者の一時停止(トレイ・ホットキー・画面)
+PAUSE_SNOOZE = "snoozed"    # 本体のスヌーズ(ctx.is_snoozed)
+PAUSE_MODE = "mode"         # ModeShift の「このモード中は止める」(M3)
+PAUSE_LABELS: dict[str, str] = {
+    PAUSE_MANUAL: "一時停止中",
+    PAUSE_SNOOZE: "スヌーズ中(記録しない)",
+    PAUSE_MODE: "モード中のため停止(記録しない)",
+}
+MODE_STATE_FILE = "mode_state.json"  # 最後に受けた ModeShift のモード名(再起動をまたいで停止状態を保つ)
+SWEEP_INTERVAL_MS = 60_000            # 短命記録の期限切れ掃除と状態表示の見直し(低頻度)
 REASON_LABELS: dict[str, str] = {
     policy.RECORDED: "記録した",
     policy.OBSERVE_ONLY: "観察のみ(記録対象)",
@@ -96,12 +108,15 @@ class ClipShelfModule:
         self._pending_paste_target = 0
         self._debounce: QTimer | None = None
         self._paste_timer: QTimer | None = None
+        self._sweep_timer: QTimer | None = None
         self._pause_item: Any = None
+        self._last_status = ""
+        self._active_mode: str | None = self._load_mode_state()
         self.writer = ClipWriter(self.api, ctx.hidden_hwnd, lambda: self.config.open_retry)
         self.paster = Paster(self.api, ctx.foreground, self.ops, self.log)
         self.monitor = ClipMonitor(
             self.api, owner_hwnd=ctx.hidden_hwnd, config=lambda: self.config, store=lambda: self.store,
-            paused=lambda: self.paused, log=self.log, ops=self.ops, now=now, on_decision=self._on_decision,
+            paused=lambda: bool(self.pause_reasons()), log=self.log, ops=self.ops, now=now, on_decision=self._on_decision,
         )
 
     # ================================================================ ライフサイクル
@@ -109,23 +124,35 @@ class ClipShelfModule:
         self._open_store()
         if self.store is not None:
             self.monitor.trim(self.config)  # 起動時の保持上限(FR-8)
+            self.sweep_expired()            # 起動時の短命記録の掃除(C3)
         self.monitor.mark_startup()  # D-15: 起動時点の内容は記録しない
         self._debounce = self.ctx.start_timer(self.config.debounce_ms, self._on_debounced, single_shot=True)
         self._debounce.stop()
         self._paste_timer = self.ctx.start_timer(150, self._on_paste_timer, single_shot=True)
         self._paste_timer.stop()
+        self._sweep_timer = self.ctx.start_timer(SWEEP_INTERVAL_MS, self._periodic)
         self.ctx.on_native(WM_CLIPBOARDUPDATE, self._on_clip_update)
+        # M3: ModeShift のモード切替・復帰を受けて記録を止める/再開する(通知はしない。状態表示だけ)
+        self.ctx.on("modeshift.switched", self._on_mode_switched)
+        self.ctx.on("modeshift.reverted", self._on_mode_reverted)
+        self.ctx.on("host.snooze_changed", lambda _p: self._update_status())
         self._register_hotkeys()
         self._build_tray()
         self._build_quick_actions()
         self._update_status()
         self.log.info("clipshelf started mode=%s history=%d", self.config.mode, self.counts()["history"])
         if self.store is not None and self.store.undecryptable:
-            self.ctx.notify("ClipShelf", f"復号できない項目が {self.store.undecryptable} 件あります(表示しません)。"
-                            "別ユーザー・再作成したプロファイルのデータの可能性があります。全消去を検討してください。", level="warn")
+            bad = self.store.undecryptable_counts()
+            if bad["history"]:
+                self.ctx.notify("ClipShelf", f"復号できない履歴が {bad['history']} 件あります(表示しません)。"
+                                "別ユーザー・再作成したプロファイルのデータの可能性があります。"
+                                "全消去で削除できます。", level="warn")
+            if bad["snippets"]:
+                self.ctx.notify("ClipShelf", f"復号できない定型文が {bad['snippets']} 件あります(表示しません)。"
+                                "別ユーザー・再作成したプロファイルのデータの可能性があります。", level="warn")
 
     def stop(self) -> None:
-        for t in (self._debounce, self._paste_timer):
+        for t in (self._debounce, self._paste_timer, self._sweep_timer):
             if t is not None:
                 t.stop()
         if self._palette is not None:
@@ -152,7 +179,8 @@ class ClipShelfModule:
         if cmd == "status":
             c = self.counts()
             return 0, (f"mode={self.config.mode} paused={int(self.paused)} history={c['history']} "
-                       f"pinned={c['pinned']} snippets={c['snippets']} store={'ok' if self.store else 'error'}")
+                       f"pinned={c['pinned']} snippets={c['snippets']} store={'ok' if self.store else 'error'} "
+                       f"stopped_by={','.join(self.pause_reasons()) or 'none'}")
         return 2, "unsupported"
 
     def create_page(self) -> QWidget:
@@ -308,15 +336,146 @@ class ClipShelfModule:
     def status_text(self) -> str:
         if self.store is None:
             return "停止: DB を開けません"
-        if self.paused:
-            return "一時停止中"
+        reasons = self.pause_reasons()
+        if reasons:
+            return PAUSE_LABELS[reasons[0]]
         return "観察モード(記録しない)" if self.config.mode == "observe" else "記録中"
 
     def _update_status(self) -> None:
-        self.ctx.set_tray_status(self.status_text())
+        self._last_status = self.status_text()
+        self.ctx.set_tray_status(self._last_status)
         if self._pause_item is not None:
             self._pause_item.set_checked(self.paused)
         self.notifier.changed.emit()
+
+    # ---------------------------------------------------------------- 記録を止める理由(手動・スヌーズ・モード)
+    def is_snoozed(self) -> bool:
+        """本体のスヌーズ中か。古い本体(is_snoozed が無い)では常に False。"""
+        fn = getattr(self.ctx, "is_snoozed", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001 - 本体側の不具合で記録処理を止めない(スヌーズではない扱い)
+            self.log.warning("is_snoozed failed")
+            return False
+
+    def mode_paused(self) -> bool:
+        return self._active_mode is not None and self._active_mode in self.config.pause_in_modes
+
+    def pause_reasons(self) -> list[str]:
+        """記録を止めている理由コード(優先順)。空なら止めていない。"""
+        out: list[str] = []
+        if self.paused:
+            out.append(PAUSE_MANUAL)
+        if self.is_snoozed():
+            out.append(PAUSE_SNOOZE)
+        if self.mode_paused():
+            out.append(PAUSE_MODE)
+        return out
+
+    def active_mode(self) -> str | None:
+        """最後に受けた ModeShift のモード名(画面表示用。ログ・診断には出さない)。"""
+        return self._active_mode
+
+    def mode_choices(self) -> list[tuple[str, str]]:
+        """「このモード中は止める」の選択肢(ModeShift の設定にあるモード)。古い本体では空。"""
+        fn = getattr(self.ctx, "list_modes", None)
+        if not callable(fn):
+            return []
+        try:
+            got = fn()
+        except Exception:  # noqa: BLE001
+            self.log.warning("list_modes failed")
+            return []
+        out: list[tuple[str, str]] = []
+        for pair in got or []:
+            if isinstance(pair, (tuple, list)) and len(pair) == 2 and isinstance(pair[0], str) and pair[0]:
+                out.append((pair[0], str(pair[1] or pair[0])))
+        return out
+
+    def _on_mode_switched(self, payload: Mapping[str, Any]) -> None:
+        mode = payload.get("mode")
+        if isinstance(mode, str) and mode:
+            self._set_active_mode(mode)
+
+    def _on_mode_reverted(self, _payload: Mapping[str, Any]) -> None:
+        self._set_active_mode(None)
+
+    def clear_mode_pause(self) -> None:
+        """「モード中のため停止」を利用者が手で解除する(ModeShift の復帰を取りこぼした場合の逃げ道)。"""
+        self._set_active_mode(None)
+
+    def _set_active_mode(self, mode: str | None) -> None:
+        before = self.mode_paused()
+        self._active_mode = mode
+        self._save_mode_state()
+        after = self.mode_paused()
+        if before != after:
+            self.log.info("recording %s by mode", "paused" if after else "resumed")  # モード名は出さない
+        self._update_status()
+
+    def _load_mode_state(self) -> str | None:
+        try:
+            obj = json.loads((self.ctx.data_dir / MODE_STATE_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        mode = obj.get("mode") if isinstance(obj, dict) else None
+        return mode if isinstance(mode, str) and mode else None
+
+    def _save_mode_state(self) -> None:
+        path = self.ctx.data_dir / MODE_STATE_FILE
+        try:
+            if self._active_mode is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"mode": self._active_mode}, ensure_ascii=False), encoding="utf-8")
+        except OSError as e:
+            self.log.warning("mode state write failed: %s", type(e).__name__)
+
+    # ---------------------------------------------------------------- 定期処理(短命記録の掃除・状態表示の見直し)
+    def _periodic(self) -> None:
+        self.sweep_expired()
+        if self.status_text() != self._last_status:  # スヌーズの開始・終了をイベント無しでも拾う
+            self._update_status()
+
+    def sweep_expired(self) -> int:
+        """期限を過ぎた短命記録(C3)を消す。操作ログには件数だけ。"""
+        if self.store is None or not self.store.is_open:
+            return 0
+        try:
+            n = self.store.expire()
+        except StoreError as e:
+            self.log.error("expire failed: %s", e)
+            return 0
+        if n:
+            self.ops.write("expired", deleted=n)
+            self.log.info("expired deleted=%d", n)
+            self.notifier.changed.emit()
+        return n
+
+    # ---------------------------------------------------------------- 診断(本文・exe 名・モード名を入れない)
+    def diagnostics(self) -> dict[str, str | int | bool]:
+        c = self.counts()
+        reasons = self.pause_reasons()
+        return {
+            "mode": self.config.mode,
+            "store_ok": self.store is not None,
+            "history": c["history"],
+            "pinned": c["pinned"],
+            "snippets": c["snippets"],
+            "undecryptable": c["undecryptable"],
+            "short_lived_items": self.store.short_lived_count() if self.store is not None else 0,
+            "short_lived_apps": len(self.config.short_lived_exes),
+            "recording_paused": bool(reasons),
+            "paused_reasons": ",".join(reasons) if reasons else "none",
+            "pause_in_modes": len(self.config.pause_in_modes),
+            "exclude_apps": len(self.config.exclude_exes),
+            "unknown_owner_policy": self.config.unknown_owner_policy,
+            "auto_paste": self.config.auto_paste,
+            "hotkeys_failed": sum(1 for ok in self.hotkey_ok.values() if not ok),
+        }
 
     def set_paused(self, paused: bool) -> None:
         self.paused = paused
@@ -352,6 +511,12 @@ class ClipShelfModule:
         self._update_status()
         return None
 
+    def retention_preview(self, max_items: int, max_days: int) -> int:
+        """その保持上限にしたら今ある履歴が何件消えるか(消さない)。"""
+        if self.store is None or not self.store.is_open:
+            return 0
+        return self.store.trim_preview(max_items, max_days)
+
     # ================================================================ パレット用の窓口
     def search_history(self, query: str) -> list[Item]:
         return search.search(self.store.history(), query, 500) if self.store else []
@@ -359,16 +524,24 @@ class ClipShelfModule:
     def search_snippets(self, query: str) -> list[Item]:
         return search.search(self.store.snippets(), query, 500) if self.store else []
 
-    def snippet_preview(self, text: str) -> snippets.Expansion:
-        """プレビュー用の展開。{clipboard} は本文を読まず目印に置き換え、テキストが無いときだけ警告する。"""
+    def snippet_preview(self, text: str, values: Mapping[str, str] | None = None) -> snippets.Expansion:
+        """プレビュー用の展開。{clipboard} は本文を読まず目印に置き換え、テキストが無いときだけ警告する。
+        values が None なら入力欄・選択欄は〔ラベル〕の目印、辞書ならその値(パレットの入力フォームのライブ表示)。"""
         exp = snippets.expand(text, self._now(), None, date_format=self.config.date_format,
-                              time_format=self.config.time_format, clipboard_marker=CLIPBOARD_MARKER)
+                              time_format=self.config.time_format, clipboard_marker=CLIPBOARD_MARKER, values=values)
         if exp.used_clipboard and not self.writer.has_text():
             exp.warnings.append("クリップボードにテキストが無いため {clipboard} は空になります")
         return exp
 
-    def choose(self, item: Item) -> None:
-        """パレットで選んだ項目をクリップボードに置き、元の foreground へ戻す(FR-12)。"""
+    @staticmethod
+    def snippet_fields(item: Item) -> list[snippets.Field]:
+        """貼り付け前にパレットで聞く欄(定型文の {input:…} / {select:…})。履歴は常に空。"""
+        return snippets.fields(item.text) if item.kind == KIND_SNIPPET else []
+
+    def choose(self, item: Item, values: Mapping[str, str] | None = None, transform: str | None = None) -> None:
+        """パレットで選んだ項目をクリップボードに置き、元の foreground へ戻す(FR-12)。
+        values は定型文の入力欄・選択欄の値(無い欄は既定値)。transform は利用者が明示的に選んだ変換の ID(C2)。
+        値と変換結果はクリップボードに書くだけで、ログ・DB には残さない(INV-1/2)。"""
         marks: Marks = {}
         if item.kind == KIND_SNIPPET:
             clip_text: str | None = None
@@ -379,10 +552,19 @@ class ClipShelfModule:
                     return
                 clip_text, marks = got  # 除外形式は展開結果にも引き継ぐ(FR-17)
             exp = snippets.expand(item.text, self._now(), clip_text, date_format=self.config.date_format,
-                                  time_format=self.config.time_format)
+                                  time_format=self.config.time_format, values=dict(values or {}))
             text = exp.text
         else:
             text = item.text
+        if transform:
+            try:
+                text = transforms.apply(transform, text)
+            except ValueError:
+                self.log.warning("unknown transform=%s", transform)
+                return
+            if not text:
+                self.ctx.notify("ClipShelf", "変換した結果が空になったため、クリップボードに置きませんでした", level="info")
+                return
         if not self.writer.write(text, item.id, marks):
             self.ctx.notify("ClipShelf", "クリップボードに書き込めませんでした(他のアプリが使用中)", level="warn")
             return
@@ -391,7 +573,9 @@ class ClipShelfModule:
                 self.store.touch(item.id)
             except StoreError as e:
                 self.log.error("touch failed: %s", e)
-        self.log.info("item chosen id=%d kind=%s", item.id, item.kind)
+        self.log.info("item chosen id=%d kind=%s transform=%s", item.id, item.kind, transform or "none")
+        if transform:
+            self.ops.write("transform_paste", transform=transform)  # 変換の種類だけ(本文・文字数は書かない)
         target = self._target_hwnd
         restored = self.paster.restore(target)
         if self._palette is not None:
@@ -446,9 +630,11 @@ class ClipShelfModule:
             widgets.message(parent, "全消去できません", self.store_error or "DB が開かれていません", kind="error")
             return
         c = self.counts()
+        bad = self.store.undecryptable_counts()["history"]
+        extra = f"復号できない履歴 {bad} 件も削除します。" if bad else ""
         ok, checks = widgets.confirm(
             parent, "履歴を全消去",
-            f"履歴 {c['history']} 件(うちピン {c['pinned']} 件)を完全に削除します。元に戻せません。定型文は消えません。",
+            f"履歴 {c['history']} 件(うちピン {c['pinned']} 件)を完全に削除します。{extra}元に戻せません。定型文は消えません。",
             ok_text="全消去", danger=True,
             checks=[("ピンも消す", False), ("現在のクリップボードも空にする", True)],
         )
@@ -488,6 +674,7 @@ class ClipShelfModule:
             self.log.info("palette_blocked reason=%s exe=%s", blocked, fg.exe or "(不明)")  # D-13: 開かない
             return
         self._target_hwnd = int(fg.hwnd or 0)
+        self.sweep_expired()  # 期限切れの短命記録を出さない(定期掃除の間隔の隙間を埋める)
         self.ops.write("palette_open")
         self.log.info("palette_open")
         from deskkit.modules.clipshelf.palette import Palette

@@ -20,6 +20,11 @@ GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,40}$")
 PREVIEW_POLICIES = ("unconfirmed_only", "always")
 ON_EXIT = ("undo", "none")
+# 自動切替のきっかけ。exe = プロセスの出現/消滅(FR-23)/ on_battery・on_ac = 電源の切り替わり(v0.2。WM_POWERBROADCAST)
+TRIGGER_EXE, TRIGGER_BATTERY, TRIGGER_AC = "exe", "on_battery", "on_ac"
+TRIGGERS = (TRIGGER_EXE, TRIGGER_BATTERY, TRIGGER_AC)
+POWER_TRIGGERS = (TRIGGER_BATTERY, TRIGGER_AC)
+THEMES = ("dark", "light")
 # open_path で開かない拡張子(既定のハンドラ経由で実行・昇格要求になり得るもの。INV-7)
 EXEC_EXTENSIONS = frozenset({".exe", ".com", ".bat", ".cmd", ".scr", ".msi", ".ps1", ".vbs", ".vbe", ".js",
                              ".jse", ".wsf", ".wsh", ".hta", ".lnk", ".pif", ".cpl", ".msc", ".reg"})
@@ -79,6 +84,18 @@ def safe_url(url: str) -> str:
     if m.group("rest"):
         s += "?…"
     return s
+
+
+def url_host(url: str) -> str:
+    """ログ(ops.jsonl)用: ホスト名だけ(小文字。スキーム・ユーザー情報・ポート・パス・クエリは落とす)。
+    利用者の判断(v0.2): 保存されるログには URL のドメインだけを書く。画面のプレビューは safe_url のまま。"""
+    m = _URL_RE.match(url)
+    if not m:
+        return "(解釈できない URL)"
+    host = m.group("host").rsplit("@", 1)[-1]
+    # IPv6 リテラル([::1]:8080)は角かっこまで、それ以外はポートを落とす
+    host = host.split("]", 1)[0] + "]" if host.startswith("[") else host.split(":", 1)[0]
+    return host.lower() or "(解釈できない URL)"
 
 
 @dataclass
@@ -160,7 +177,7 @@ def normalize_action(a: Any, game_processes: Iterable[str] = (), fs: FsCheck | N
             errs.append(f"{label}: guid が GUID の形式ではありません")
             g = g if isinstance(g, str) else ""
         out["guid"] = g.strip().lower()
-    elif t == "master_volume":
+    elif t in ("master_volume", "mic_volume"):
         lv = a.get("level")
         mute = a.get("mute")
         if lv is not None and (not _is_num(lv) or not (0.0 <= float(lv) <= 1.0)):
@@ -172,6 +189,17 @@ def normalize_action(a: Any, game_processes: Iterable[str] = (), fs: FsCheck | N
         if lv is None and mute is None and not errs:
             errs.append(f"{label}: level か mute のどちらかを指定してください")
         out.update(level=None if lv is None else float(lv), mute=mute)
+    elif t == "theme":
+        vals: dict[str, str | None] = {}
+        for key in ("apps", "system"):
+            v = a.get(key)
+            if v is not None and v not in THEMES:
+                errs.append(f"{label}: {key} は dark / light / null にしてください")
+                v = None
+            vals[key] = v
+        if vals["apps"] is None and vals["system"] is None and not errs:
+            errs.append(f"{label}: apps か system のどちらかを指定してください")
+        out.update(apps=vals["apps"], system=vals["system"])
     elif t == "open_path":
         p = a.get("path")
         if not isinstance(p, str) or not p.strip():
@@ -199,6 +227,15 @@ def normalize_action(a: Any, game_processes: Iterable[str] = (), fs: FsCheck | N
             errs.append(f"{label}: wait_s は 0〜600 秒にしてください")
             ws = 0
         out.update(layout=lay.strip() if isinstance(lay, str) else None, wait_s=float(ws))
+        # 任意の preset(LayoutKeep のプリセット名。契約 §2)。未指定のときはキー自体を持たない
+        # (既存のモードの定義ハッシュを変えず、確認済みのまま使えるようにする)
+        pre = a.get("preset")
+        if pre is not None and not isinstance(pre, str):
+            errs.append(f"{label}: preset は文字列にしてください")
+        elif isinstance(pre, str) and pre.strip():
+            if len(pre.strip()) > 100:
+                errs.append(f"{label}: preset は 100 文字までにしてください")
+            out["preset"] = pre.strip()
     return out, errs
 
 
@@ -237,10 +274,15 @@ class ModeDef:
 
 @dataclass
 class AutoRule:
-    exe: str
+    exe: str                     # trigger が exe のときだけ使う(電源のきっかけでは "")
     mode: str
     on_exit: str
     error: str | None = None
+    trigger: str = TRIGGER_EXE
+
+    @property
+    def is_power(self) -> bool:
+        return self.trigger in POWER_TRIGGERS
 
 
 @dataclass
@@ -268,8 +310,18 @@ class Config:
         return [m for m in self.modes if not m.valid]
 
     @property
-    def auto_active(self) -> bool:
+    def auto_poll_active(self) -> bool:
+        """プロセス一覧のポーリング(exe のきっかけ)が動くか。"""
         return self.auto_enabled and self.auto_error is None and self.poll_interval_s is not None
+
+    @property
+    def auto_power_active(self) -> bool:
+        """電源のきっかけ(イベント駆動。poll_interval_s は要らない)が動くか。"""
+        return self.auto_enabled and any(r.is_power and r.error is None for r in self.rules)
+
+    @property
+    def auto_active(self) -> bool:
+        return self.auto_poll_active or self.auto_power_active
 
 
 def _hk_key(text: str) -> tuple[int, int] | None:
@@ -368,27 +420,42 @@ def validate_section(section: Mapping[str, Any], game_processes: Iterable[str] =
     if poll is not None and (not _is_num(poll) or not (POLL_MIN_S <= float(poll) <= POLL_MAX_S)):
         auto_error = f"poll_interval_s は {POLL_MIN_S:g}〜{POLL_MAX_S:g} 秒にしてください"
         poll = None
-    if enabled and poll is None and auto_error is None:
-        auto_error = "poll_interval_s が未設定のため自動切替は無効です"
     rules: list[AutoRule] = []
     rr = auto.get("rules", [])
     if not isinstance(rr, list):
         rr = []
     names = {m.name for m in modes if m.valid}
+    power_seen: set[str] = set()
     for r in rr:
         if not isinstance(r, Mapping):
             continue
-        exe = str(r.get("exe") or "").strip().lower()
+        trigger = r.get("trigger") or TRIGGER_EXE
         mode = str(r.get("mode") or "")
         on_exit = r.get("on_exit") or "none"
         err = None
-        if not exe_name_ok(exe):
-            err = "exe はファイル名(例: game.exe)で指定してください"
-        elif mode not in names:
+        exe = ""
+        if trigger not in TRIGGERS:
+            err = "trigger は exe / on_battery / on_ac にしてください"
+            trigger = str(trigger)
+        elif trigger == TRIGGER_EXE:
+            exe = str(r.get("exe") or "").strip().lower()
+            if not exe_name_ok(exe):
+                err = "exe はファイル名(例: game.exe)で指定してください"
+        elif trigger in power_seen:
+            err = "同じ電源のきっかけのルールが既にあります(先のルールだけ使います)"
+        if err is None and mode not in names:
             err = f"モード '{mode}' が無いか無効です"
-        elif on_exit not in ON_EXIT:
+        elif err is None and on_exit not in ON_EXIT:
             err = "on_exit は undo / none にしてください"
-        rules.append(AutoRule(exe, mode, str(on_exit), err))
+        if trigger in POWER_TRIGGERS and err is None:
+            power_seen.add(trigger)
+        rules.append(AutoRule(exe, mode, str(on_exit), err, str(trigger)))
+    # poll_interval_s は exe のきっかけにだけ要る(§9.2: 未設定のまま有効にしたら設定エラー)。
+    # 電源のきっかけだけのときはイベントで動くので要らない
+    has_exe = any(r.trigger == TRIGGER_EXE for r in rules)
+    has_power = any(r.is_power for r in rules)
+    if enabled and poll is None and auto_error is None and (has_exe or not has_power):
+        auto_error = "poll_interval_s が未設定のため自動切替(exe の起動)は無効です"
     return Config(
         preview=str(preview), allow_force_kill=afk, undo_hotkey=undo_hk, modes=modes,
         auto_enabled=enabled, poll_interval_s=float(poll) if poll is not None else None,

@@ -1,9 +1,10 @@
-# Control Center の DropSort 画面: 状態(ヒーロー・数値タイル)、ルール編集、既存ファイルの整理、試運転の結果、
-# 操作履歴と元に戻す、要確認の一覧、アーカイブ設定、詳細設定。トレイから開く「試運転の結果」ダイアログもここ。
+# Control Center の DropSort 画面: 状態(ヒーロー・数値タイル)、ルール編集(実績・本番化の提案・試し当て)、
+# 既存ファイルの整理、試運転の結果、操作履歴と元に戻す、要確認の一覧、アーカイブ設定、詳細設定(モード連携など)。
 # ファイルを開く・実行する・エクスプローラーで表示する操作は置かない(INV-1)。パスは文字で見せるだけ。
 from __future__ import annotations
 
 import ntpath
+import time
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -13,6 +14,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
@@ -31,9 +33,13 @@ from shiboken6 import isValid
 
 from deskkit import catalog
 from deskkit.modules.dropsort import paths as dpaths
+from deskkit.modules.dropsort import stats as dstats
+from deskkit.modules.dropsort import template as tpl
 from deskkit.modules.dropsort.config import TEMPLATES, ZONE_NAMES, ConfigError, new_rule, norm_ext, parse_rule
 from deskkit.modules.dropsort.rules import describe, fmt_size, fmt_size_exact, parse_size
 from deskkit.modules.dropsort.service import OP_TEXT, BatchResult, reason_text
+from deskkit.modules.dropsort.stats import RuleStats
+from deskkit.modules.dropsort.tester import make_motw, simulate
 from deskkit.ui import theme as T
 from deskkit.ui import widgets as W
 from deskkit.ui.theme import G
@@ -189,6 +195,7 @@ class RuleEditDialog(W.StyledDialog):
         ext = m.get("ext") or []
         self.ext = QLineEdit(" ".join(ext if isinstance(ext, list) else [str(ext)]))
         self.ext.setPlaceholderText("拡張子 例: .pdf .docx(空白かカンマ区切り)")
+        self.ext.textChanged.connect(page.ctx.safe(self._check_dest, "dropsort:ext"))
         self.body.addLayout(self._row("拡張子", self.ext))
         self.regex = QLineEdit(str(m.get("name_regex") or ""))
         self.regex.setPlaceholderText("ファイル名の正規表現(部分一致) 例: ^invoice_")
@@ -229,6 +236,13 @@ class RuleEditDialog(W.StyledDialog):
         self.body.addLayout(W.hbox(self.dest, browse, self.mk))
         self.dest_state = W.label("", "Mute", wrap=True)
         self.body.addWidget(self.dest_state)
+        self.dest_preview = W.label("", "Dim", wrap=True)
+        self.dest_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.dest_preview.setVisible(False)
+        self.body.addWidget(self.dest_preview)
+        self.body.addWidget(W.label("移動先に {yyyy} {mm} {dd}(ファイルが来た日)・{ext}(拡張子)・{domain}(入手元。分からなければ "
+                                    f"{tpl.UNKNOWN_DOMAIN})を書くと、その前のフォルダの下に自動でフォルダを作って分けます"
+                                    "(例: D:\\整理\\{yyyy}\\{mm})。その前のフォルダ自体は自動では作りません。", "Mute", wrap=True))
         self.err = W.label("", wrap=True)
         self.err.setStyleSheet(f"color: {T.DANGER};")
         self.err.setVisible(False)
@@ -258,25 +272,45 @@ class RuleEditDialog(W.StyledDialog):
             self.regex_state.setText(f"不正: {e.msg}")
             self.regex_state.setStyleSheet(f"color: {T.DANGER};")
 
+    def _target(self) -> str:
+        """検査と「フォルダを作成」の対象: テンプレートならその前のフォルダ(基準フォルダ)。"""
+        d = self.dest.text().strip()
+        return tpl.base(d) if tpl.has_placeholder(d) else d
+
     def _check_dest(self, *_: Any) -> None:
         d = self.dest.text().strip()
         self.mk.setVisible(False)
+        self.dest_preview.setVisible(False)
         if not d:
             self.dest_state.setText("「参照…」でフォルダを選んでください。")
             self.dest_state.setStyleSheet(f"color: {T.TEXT_MUTE};")
             return
+        prefix = ""
+        if tpl.has_placeholder(d):
+            err = tpl.validate(d)
+            if err is not None:
+                self.dest_state.setText(err)
+                self.dest_state.setStyleSheet(f"color: {T.DANGER};")
+                return
+            exts = [norm_ext(x) for x in self.ext.text().replace(",", " ").split()]
+            ext = next((e for e in exts if e), ".pdf")
+            self.dest_preview.setText(f"例: {tpl.example(d, when=time.time(), ext=ext)}"
+                                      f"(今日来た example{ext}・入手元 example.com の場合)")
+            self.dest_preview.setVisible(True)
+            prefix = f"基準フォルダ {tpl.base(d)}: "
+        target = self._target()
         svc = self._m.service
-        c = dpaths.check_dest(svc.api, d, svc.downloads, self._m.cfg.archive.dir_name)
+        c = dpaths.check_dest(svc.api, target, svc.downloads, self._m.cfg.archive.dir_name)
         if c.ok:
             fs = c.volume.fs_name if c.volume else "?"
             ns = bool(c.volume and c.volume.named_streams)
-            msg = f"OK — {fs}" + ("" if ns else "(代替データストリーム非対応: MOTW 付きのファイルは移動を拒否します)")
+            msg = f"{prefix}OK — {fs}" + ("" if ns else "(代替データストリーム非対応: MOTW 付きのファイルは移動を拒否します)")
             self.dest_state.setText(msg)
             self.dest_state.setStyleSheet(f"color: {T.SUCCESS if ns else T.WARN};")
         else:
-            self.dest_state.setText(c.message or "使えません")
+            self.dest_state.setText(prefix + (c.message or "使えません"))
             self.dest_state.setStyleSheet(f"color: {T.DANGER if c.code == 'network_dest' else T.WARN};")
-            self.mk.setVisible(c.code == "dest_missing" and ntpath.isabs(d) and len(d) > 3 and d[1] == ":")
+            self.mk.setVisible(c.code == "dest_missing" and ntpath.isabs(target) and len(target) > 3 and target[1] == ":")
 
     def _browse(self) -> None:
         start = self.dest.text().strip() or (self._m.service.downloads or "")
@@ -285,7 +319,7 @@ class RuleEditDialog(W.StyledDialog):
             self.dest.setText(ntpath.normpath(d))
 
     def _mkdir(self) -> None:
-        d = ntpath.normpath(self.dest.text().strip())
+        d = ntpath.normpath(self._target())
         ok, _ = W.confirm(self, "フォルダを作成", f"次のフォルダを作成します。\n{d}", ok_text="作成")
         if not ok:
             return
@@ -324,7 +358,7 @@ class RuleEditDialog(W.StyledDialog):
         if rd.error:
             return self._fail(rd.error)
         svc = self._m.service
-        c = dpaths.check_dest(svc.api, rule["dest"], svc.downloads, self._m.cfg.archive.dir_name)
+        c = dpaths.check_dest(svc.api, rd.base_dest, svc.downloads, self._m.cfg.archive.dir_name)
         if not c.ok and c.code in ("network_dest", "dest_is_downloads", "dest_in_archive"):
             return self._fail(c.message or "この移動先は使えません。")
         if not c.ok:
@@ -343,6 +377,8 @@ class RuleCard(QFrame):
         super().__init__()
         self.setObjectName("Inset")
         s = page.ctx.safe
+        self.rule_name = str(rule.get("name") or f"#{idx + 1}")
+        self.apply = str(rule.get("mode") or "dry-run") == "apply"
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(8)
@@ -353,6 +389,7 @@ class RuleCard(QFrame):
         name = W.label(str(rule.get("name") or f"#{idx + 1}"), "H3")
         mode = W.Segmented([("dry-run", "試運転"), ("apply", "本番")], str(rule.get("mode") or "dry-run"), _acc())
         mode.changed.connect(s(lambda v, i=idx, seg=mode: page.set_rule_mode(i, v, seg), "dropsort:rule-mode"))
+        self.mode_seg = mode
         up = W.icon_button(G.UP, "上へ", s(lambda i=idx: page.move_rule(i, -1), "dropsort:up"))
         down = W.icon_button(G.DOWN, "下へ", s(lambda i=idx: page.move_rule(i, 1), "dropsort:down"))
         up.setEnabled(idx > 0)
@@ -363,6 +400,7 @@ class RuleCard(QFrame):
 
         rd = parse_rule(idx, rule)
         chk = page.m.service.rule_checks.get(idx)
+        self.valid = rd.error is None and (chk is None or chk.ok)
         dest = str(rule.get("dest") or "(未設定)")
         dest_lb = W.label(f"{G.FOLDER}  {dest}", "Dim")
         f = T.ui_font(12)
@@ -381,6 +419,11 @@ class RuleCard(QFrame):
         else:
             pill = W.StatusPill("未検査", "off")
         lay.addLayout(W.hbox(dest_lb, None, pill))
+        if rd.is_template:
+            ex = W.label(f"例: {tpl.example(rd.dest, when=time.time(), ext=next(iter(sorted(rd.match.ext or [])), '.pdf'))}",
+                         "Mute")
+            ex.setToolTip("今日来たファイル・入手元 example.com の場合の行き先。足りないフォルダは移動のときに作ります。")
+            lay.addWidget(ex)
         chips = QHBoxLayout()
         chips.setSpacing(6)
         for d in (describe(rd) if not rd.error else ["—"]):
@@ -389,6 +432,21 @@ class RuleCard(QFrame):
             chips.addWidget(c)
         chips.addStretch(1)
         lay.addLayout(chips)
+        # 実績(D3): 作業スレッドで集計して後から入れる
+        self.stats_label = W.label("実績を集計しています…", "Mute")
+        self.promote = W.button("本番へ切り替え", "primary", G.LIGHTNING,
+                                on_click=s(lambda i=idx: page.promote_rule(i), "dropsort:promote"))
+        self.promote.setToolTip(f"試運転で {dstats.PROMOTE_MIN_DAYS} 日以上・{dstats.PROMOTE_MIN_PLANNED} 件以上の予定があり、"
+                                "拒否・取り消しが無いルールに出します。切り替えるかどうかはあなたが決めます。")
+        self.promote.setVisible(False)
+        lay.addLayout(W.hbox(W.Glyph(G.CLOCK, 12, T.TEXT_MUTE), self.stats_label, None, self.promote, spacing=6))
+
+    def set_stats(self, s: RuleStats | None, now: float) -> None:
+        self.stats_label.setText(dstats.summary(s, self.apply))
+        ready = not self.apply and self.valid and dstats.promotion_ready(s, now)
+        self.promote.setVisible(ready)
+        if ready:
+            self.stats_label.setText(self.stats_label.text() + " — 本番に切り替えても良さそうです")
 
 
 # ------------------------------------------------------------------ 画面本体
@@ -415,7 +473,8 @@ class DropSortPage(W.ScrollPage):
         self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.btn_pause = W.button("一時停止", "primary", G.PAUSE, on_click=s(self._toggle_pause, "dropsort:pause"))
         hero.add_action(self.btn_pause)
-        hero.add_action(W.button("今すぐスキャン", "secondary", G.REFRESH, on_click=s(lambda: self.m.request_scan(0), "dropsort:scan")))
+        hero.add_action(W.button("今すぐスキャン", "secondary", G.REFRESH,
+                                 on_click=s(lambda: self.m.request_scan(0, manual=True), "dropsort:scan")))
         hero.add_action(W.button("直前を元に戻す", "secondary", G.UNDO, on_click=s(self._undo_last, "dropsort:undo1")))
         self.add(hero)
         pathw = QWidget()
@@ -540,10 +599,15 @@ class DropSortPage(W.ScrollPage):
         m = self.m
         svc = m.service
         dl = svc.downloads
+        blocked = m.auto_blocked()
         if dl is None:
             self.pill_state.set_state("error", "監視先なし")
         elif m.cfg.paused:
             self.pill_state.set_state("warn", "一時停止")
+        elif blocked == "mode":
+            self.pill_state.set_state("warn", f"停止中: モード「{m.mode_label(m.mode_paused)}」")
+        elif blocked == "snooze":
+            self.pill_state.set_state("warn", "停止中: スヌーズ")
         else:
             self.pill_state.set_state("ok", "監視中")
         dry_rules = sum(1 for r in m.cfg.rules if r.mode != "apply")
@@ -600,10 +664,99 @@ class DropSortPage(W.ScrollPage):
         self.rules_box = QVBoxLayout()
         self.rules_box.setSpacing(10)
         card.add_layout(self.rules_box)
-        note = W.label("移動先のフォルダは自動では作りません。無い場合は編集画面の「フォルダを作成」を押したときだけ作ります。"
+        note = W.label("移動先のフォルダは自動では作りません。無い場合は編集画面の「フォルダを作成」を押したときだけ作ります"
+                       "({yyyy} などのテンプレートは、その前のフォルダの下だけ自動で作ります)。"
                        "ネットワーク上のフォルダは移動先にできません。", "Mute", wrap=True)
         card.add(note)
+        card.add(self._build_tester())
         return card
+
+    # ------------------------------------------------------------ ルールを試す(D1)
+    def _build_tester(self) -> QWidget:
+        s = self.ctx.safe
+        box = QFrame()
+        box.setObjectName("Inset")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        lay.addLayout(W.hbox(W.Glyph(G.SEARCH, 16, _acc()), W.label("ルールを試す", "H3"), None))
+        lay.addWidget(W.label("ファイル名などを入れると、どのルールに当たり、どこへ動く予定かを表示します。"
+                              "ファイルには触らず、入れた内容は記録しません。", "Mute", wrap=True))
+        self.tt_name = QLineEdit()
+        self.tt_name.setPlaceholderText("ファイル名 例: invoice_2026.pdf")
+        self.tt_size = QLineEdit()
+        self.tt_size.setPlaceholderText("サイズ 例: 2MB")
+        self.tt_size.setFixedWidth(120)
+        self.tt_zone = QComboBox()
+        for label, data in (("入手元の印(MOTW)なし", "none"), ("インターネット(ゾーン 3)", "3"),
+                            ("イントラネット(ゾーン 1)", "1"), ("信頼済み(ゾーン 2)", "2"), ("ローカル(ゾーン 0)", "0"),
+                            ("制限付き(ゾーン 4)", "4"), ("MOTW あり(ゾーン不明)", "unknown")):
+            self.tt_zone.addItem(label, data)
+        self.tt_zone.setCurrentIndex(1)
+        self.tt_domain = QLineEdit()
+        self.tt_domain.setPlaceholderText("入手元のドメイン(任意) 例: github.com")
+        lay.addLayout(W.hbox(self.tt_name, self.tt_size))
+        lay.addLayout(W.hbox(self.tt_zone, self.tt_domain))
+        self.tt_result = W.label("", "H3", wrap=True)
+        self.tt_dest = W.label("", "Dim", wrap=True)
+        self.tt_dest.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.tt_notes = W.label("", "Mute", wrap=True)
+        lay.addWidget(self.tt_result)
+        lay.addWidget(self.tt_dest)
+        lay.addWidget(self.tt_notes)
+        self.tt_rules = QVBoxLayout()
+        self.tt_rules.setSpacing(2)
+        lay.addLayout(self.tt_rules)
+        run = s(self._run_tester, "dropsort:tester")
+        self.tt_name.textChanged.connect(run)
+        self.tt_size.textChanged.connect(run)
+        self.tt_domain.textChanged.connect(run)
+        self.tt_zone.currentIndexChanged.connect(run)
+        self._run_tester()
+        return box
+
+    def _run_tester(self, *_: Any) -> None:
+        while self.tt_rules.count():
+            it = self.tt_rules.takeAt(0)
+            w = it.widget() if it is not None else None
+            if w is not None:
+                w.deleteLater()
+        self.tt_dest.setText("")
+        self.tt_notes.setText("")
+        name = self.tt_name.text().strip()
+        if not name:
+            self.tt_result.setText("ファイル名を入れてください")
+            self.tt_result.setStyleSheet(f"color: {T.TEXT_MUTE};")
+            return
+        try:
+            size = parse_size(self.tt_size.text()) or 0
+        except ValueError:
+            self.tt_result.setText("サイズは 1024 / 10KB / 5MB のように入れてください")
+            self.tt_result.setStyleSheet(f"color: {T.DANGER};")
+            return
+        m = self.m
+        motw = make_motw(str(self.tt_zone.currentData() or "none"), self.tt_domain.text())
+        r = simulate(m.cfg, m.service.rule_checks, name, size, motw, time.time())
+        if r.blocked is not None:
+            self.tt_result.setText("動かしません")
+            self.tt_result.setStyleSheet(f"color: {T.WARN};")
+        elif r.matched is not None:
+            self.tt_result.setText(f"→ ルール「{r.matched.name}」({'本番' if r.matched.apply else '試運転'})")
+            self.tt_result.setStyleSheet(f"color: {T.SUCCESS};")
+        else:
+            self.tt_result.setText("どのルールにも当たりません")
+            self.tt_result.setStyleSheet(f"color: {T.TEXT_MUTE};")
+        if r.matched is not None and r.dest:
+            self.tt_dest.setText(f"{'行き先の予定' if r.blocked is None else '(当たるルールの行き先)'}: "
+                                 f"{ntpath.join(r.dest, ntpath.basename(name))}")
+        self.tt_notes.setText("\n".join(r.notes))
+        colors = {"match": T.SUCCESS, "miss": T.TEXT_MUTE, "disabled": T.DANGER, "shadowed": T.WARN}
+        for v in r.verdicts:
+            lb = W.label(f"{v.index + 1}. {v.name} — {v.text}", wrap=True)
+            lb.setStyleSheet(f"color: {colors.get(v.status, T.TEXT_DIM)}; font-size: 12px;")
+            self.tt_rules.addWidget(lb)
+        if not r.verdicts:
+            self.tt_rules.addWidget(W.label("ルールがまだありません。", "Mute"))
 
     def _rules_raw(self) -> list[dict[str, Any]]:
         rules = self.m.settings_dict().get("rules") or []
@@ -616,12 +769,34 @@ class DropSortPage(W.ScrollPage):
             if w is not None:
                 w.deleteLater()
         rules = self._rules_raw()
+        self._rule_cards: list[RuleCard] = []
+        if hasattr(self, "tt_rules"):
+            self._run_tester()
         if not rules:
             self.rules_box.addWidget(W.EmptyState(G.FILTER, "ルールがまだありません",
                                                   "「テンプレートから追加」で PDF・画像などの雛形を選び、移動先フォルダを決めてください。"))
             return
         for i, r in enumerate(rules):
-            self.rules_box.addWidget(RuleCard(self, i, r, len(rules)))
+            card = RuleCard(self, i, r, len(rules))
+            self._rule_cards.append(card)
+            self.rules_box.addWidget(card)
+        self.m.rule_stats(self._apply_stats)
+
+    def _apply_stats(self, stats: dict[str, RuleStats]) -> None:
+        if not self._alive():
+            return
+        now = self.m.service.clock()
+        for card in getattr(self, "_rule_cards", []):
+            if isValid(card):
+                card.set_stats(stats.get(card.rule_name), now)
+
+    def promote_rule(self, i: int) -> None:
+        """実績の提案から本番へ切り替える(確認ダイアログを出す。切り替えは利用者の操作だけ)。"""
+        cards = getattr(self, "_rule_cards", [])
+        if 0 <= i < len(cards) and isValid(cards[i]):
+            seg = cards[i].mode_seg
+            seg.set_value("apply")
+            self.set_rule_mode(i, "apply", seg)
 
     def _template_menu(self, anchor: QWidget) -> None:
         menu = QMenu(self)
@@ -1003,6 +1178,15 @@ class DropSortPage(W.ScrollPage):
                              W.button("既定に戻す", "ghost", G.CLEAR, on_click=s(lambda: self._set_override(None), "dropsort:ov-clear"))))
         lay.addWidget(c3)
 
+        c5 = W.Card("モード連携とスヌーズ", "ModeShift のモードがここで選んだどれかの間と、DeskKit のスヌーズ中は、自動の整理を止めます"
+                    "(「今すぐスキャン」など手で押した操作は動きます)。止まっている間に来たファイルは、再開したときにフォルダ全体を"
+                    "調べ直して扱います。止めた・再開したことは通知せず、この画面とトレイの状態に出します。", G.MODE, _acc())
+        self.pm_box = QVBoxLayout()
+        self.pm_box.setSpacing(4)
+        c5.add_layout(self.pm_box)
+        self._build_pause_modes(list(sec.get("pause_in_modes") or []))
+        lay.addWidget(c5)
+
         c4 = W.Card("その他", None, G.SETTINGS, _acc())
         self.adv_suffix = self._spin(int(sec.get("max_suffix") or 99), 1, 9999, "", "max_suffix")
         c4.add(W.SettingRow("連番の上限", "移動先に同名があるとき ' (1)' ' (2)' … をこの番号まで試します。", self.adv_suffix, G.LIST))
@@ -1015,6 +1199,31 @@ class DropSortPage(W.ScrollPage):
         c4.add(W.SettingRow("「直前を元に戻す」のホットキー", "既定は未割り当て。変更するとモジュールを再起動します。" + state, self.adv_hotkey, G.KEYBOARD))
         lay.addWidget(c4)
         return box
+
+    def _build_pause_modes(self, selected: list[str]) -> None:
+        """ModeShift のモード(ctx.list_modes)をチェックで選ぶ。今の設定に無いモード名も消さずに残す。"""
+        modes = self.m.list_modes()
+        known = {n for n, _ in modes}
+        self._pm_boxes: list[tuple[str, QCheckBox]] = []
+        for n, lb in modes:
+            cb = QCheckBox(lb if lb == n or not lb else f"{lb}({n})")
+            cb.setChecked(n in selected)
+            self._pm_boxes.append((n, cb))
+        for n in selected:
+            if n not in known:
+                cb = QCheckBox(f"{n}(今の ModeShift の設定にありません)")
+                cb.setChecked(True)
+                self._pm_boxes.append((n, cb))
+        for _n, cb in self._pm_boxes:
+            cb.toggled.connect(self.ctx.safe(lambda *_a: self._save_pause_modes(), "dropsort:pause-modes"))
+            self.pm_box.addWidget(cb)
+        if not self._pm_boxes:
+            self.pm_box.addWidget(W.label("ModeShift にモードがありません。ModeShift の画面でモードを作ると、ここで選べます。",
+                                          "Mute", wrap=True))
+
+    def _save_pause_modes(self) -> None:
+        self._set_key("pause_in_modes", [n for n, cb in self._pm_boxes if cb.isChecked()])
+        self.refresh_light()
 
     def _spin(self, value: int, lo: int, hi: int, suffix: str, key: str) -> QSpinBox:
         sp = QSpinBox()

@@ -9,25 +9,37 @@ from deskkit.modules.dropsort.config import RuleDef
 from deskkit.modules.dropsort.motw import Motw
 
 
-def matches(rule: RuleDef, name: str, size: int, motw: Motw) -> bool:
+def explain(rule: RuleDef, name: str, size: int, motw: Motw) -> str | None:
+    """一致しない理由(最初に外れた条件)を短い文で返す。一致すれば None。matches() と同じ判定。"""
+    from deskkit.modules.dropsort.config import ZONE_NAMES
+
     m = rule.match
-    if m.ext is not None and ntpath.splitext(name)[1].lower() not in m.ext:
-        return False
+    if m.ext is not None:
+        ext = ntpath.splitext(name)[1].lower()
+        if ext not in m.ext:
+            return f"拡張子が {ext or '(なし)'}(条件: {' '.join(sorted(m.ext)[:6])}{' …' if len(m.ext) > 6 else ''})"
     if rule.pattern is not None and rule.pattern.search(name) is None:
-        return False
+        return f"名前が /{m.name_regex}/ に一致しない"
     if m.size_min is not None and size < m.size_min:
-        return False
+        return f"サイズが {fmt_size(m.size_min)} 未満"
     if m.size_max is not None and size > m.size_max:
-        return False
+        return f"サイズが {fmt_size(m.size_max)} を超える"
     if m.motw is not None and motw.present != m.motw:
-        return False
+        return "MOTW(入手元の印)が無い" if m.motw else "MOTW(入手元の印)がある"
     if m.zone_ids is not None and (motw.zone_id is None or motw.zone_id not in m.zone_ids):
-        return False
+        zone = "不明" if motw.zone_id is None else ZONE_NAMES.get(motw.zone_id, str(motw.zone_id))
+        return f"ゾーンが {zone}(条件: {'・'.join(ZONE_NAMES.get(z, str(z)) for z in sorted(m.zone_ids))})"
     if m.host_domain is not None:
         d = motw.domain
-        if d is None or not any(d == x or d.endswith("." + x) for x in m.host_domain):
-            return False
-    return True
+        if d is None:
+            return "入手元のドメインが分からない"
+        if not any(d == x or d.endswith("." + x) for x in m.host_domain):
+            return f"入手元が {d}(条件: {', '.join(m.host_domain)})"
+    return None
+
+
+def matches(rule: RuleDef, name: str, size: int, motw: Motw) -> bool:
+    return explain(rule, name, size, motw) is None
 
 
 def first_match(rules: Iterable[RuleDef], name: str, size: int, motw: Motw, disabled: set[int]) -> RuleDef | None:

@@ -14,17 +14,26 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 from deskkit import APP_NAME, __version__, autostart, catalog, paths, win32
 from deskkit.events import EventBus
+from deskkit.foreground import query_foreground, query_quns
 from deskkit.hotkeys import HotkeyHub
 from deskkit.ipc import IpcServer
 from deskkit.loader import Loader
 from deskkit.nativewin import NativeWindow
+from deskkit.notify_hold import Note, NotificationHold, summary_note
 from deskkit.settings import SettingsStore
+from deskkit.snapshots import DIR_NAME as SNAPSHOT_DIR
+from deskkit.snapshots import Snapshot, SnapshotStore
+from deskkit.snooze import SnoozeManager
 from deskkit.tray import Tray
 from deskkit.ui.toast import ToastManager
 
 log = logging.getLogger("deskkit.host")
 
 CLI_ALIASES = {"mode": "modeshift"}
+ACTIVITY_CLICK_TTL = _dt.timedelta(minutes=10)  # 「最近の通知」の行クリックで元の on_click を呼ぶのはこの時間内だけ
+SNAPSHOT_DEBOUNCE_MS = 2000
+# 前面がこの通知状態(QUNS)なら、矩形で全画面と判定できなくても通知を保留する
+_QUNS_HOLD = frozenset({"running_d3d_full_screen", "presentation_mode"})
 
 
 @dataclass
@@ -33,12 +42,18 @@ class Activity:
     source: str
     title: str
     level: str
+    on_click: Callable[[], Any] | None = None
+    alive: Callable[[], bool] | None = None  # モジュールの通知なら、その ctx がまだ動いているか
 
 
 class HostSignals(QObject):
     module_changed = Signal(str)
     activity = Signal(object)
     settings_reloaded = Signal()
+    snooze_changed = Signal()
+    settings_replaced = Signal()  # 設定をファイルから読み直した(再読み込み・世代の復元・バックアップの読み込み)
+    snapshot_request = Signal()  # settings.json が書かれた(どのスレッドからでも emit してよい)
+    snapshots_changed = Signal()  # 設定の世代が増えた・減った
 
 
 class Host:
@@ -58,7 +73,23 @@ class Host:
             on_open=self.show_window, on_open_settings_file=self.open_settings_file, on_reload=self.reload,
             on_open_logs=self.open_logs, on_toggle_autostart=self.toggle_autostart,
             autostart_state=autostart.state, on_quit=self.quit,
+            on_quick=self.open_quick_actions, on_snooze=self.snooze_for, on_resume=self.resume,
         )
+        # 一時停止(H2)。状態はメモリだけ(再起動で解除)
+        self.snooze = SnoozeManager(query_quns, lambda: bool(self.settings.host().get("snooze_follow_quns", False)))
+        self.snooze.changed.connect(self._snooze_changed)
+        # 通知の保留(H1)
+        self.hold = NotificationHold(lambda: self._foreground_busy(), lambda: bool(self.settings.host().get("hold_notifications", True)),
+                                     lambda n: self._show_note(n), self._summary_note)
+        # 設定の自動世代保存(H3)。連続した書き込みは 2 秒の間まとめて1世代にする
+        self.snapshots = SnapshotStore(paths.local_dir() / SNAPSHOT_DIR,
+                                       lambda: int(self.settings.host().get("settings_history_keep", 20)))
+        self._snap_timer = QTimer()
+        self._snap_timer.setSingleShot(True)
+        self._snap_timer.setInterval(SNAPSHOT_DEBOUNCE_MS)
+        self._snap_timer.timeout.connect(self.snapshot_now)
+        self.signals.snapshot_request.connect(lambda: self._snap_timer.start())
+        self.settings.on_written = self.signals.snapshot_request.emit
         self.tray.icon.messageClicked.connect(self._balloon_clicked)
         self.native.taskbar_created_sink = self.tray.reshow
         self.loader = Loader(self)
@@ -89,6 +120,9 @@ class Host:
                         self.open_settings_file, level="error")
         elif res.created:
             log.info("既定の settings.json を作成しました")
+        if res.ok:
+            self.snapshot_now()  # 起動時点の設定を1世代目にする(同じ内容なら増えない)
+        self.snooze.sync_settings()
         self.loader.load_all()
         self.register_host_hotkeys()
         self.after_hotkey_registration()
@@ -104,15 +138,17 @@ class Host:
 
         self.hotkeys.drop("host.quick")
         text = str(self.settings.host().get("quick_action_hotkey") or "")
+        self.tray.set_quick_hotkey(None)
         if not text:
             return
         try:
             mods, vk = parse_hotkey(text)
-            self.hotkeys.registry.register("host.quick", mods, vk)
+            self.hotkeys.register("host.quick", mods, vk)
         except (ValueError, HotkeyError):
-            self.hotkeys.conflicts.append(("host.quick", text))
+            self.hotkeys.note_conflict("host.quick", text)
             return
         self.hotkeys.add_callback("host.quick", self._quick_hotkey)
+        self.tray.set_quick_hotkey(self.hotkeys.combo_text("host.quick"))
 
     def _quick_hotkey(self) -> None:
         try:
@@ -151,20 +187,55 @@ class Host:
     def title_of(self, name: str) -> str:
         return APP_NAME if name == "host" else catalog.info(name).title
 
-    def notify(self, source: str, title: str, text: str, on_click: Callable[[], Any] | None, *, level: str = "info") -> None:
-        log.info("notify source=%s level=%s", source, level)  # 種類だけ(INV-7)
-        act = Activity(_dt.datetime.now(), source, title, level)
+    def notify(self, source: str, title: str, text: str, on_click: Callable[[], Any] | None, *, level: str = "info",
+               alive: Callable[[], bool] | None = None) -> None:
+        """通知を記録してトーストで出す。ゲーム・全画面中は error 以外を保留する(H1。記録はすぐに行う)。"""
+        act = Activity(_dt.datetime.now(), source, title, level, on_click, alive)
         self.activities.insert(0, act)
         del self.activities[60:]
         self.signals.activity.emit(act)
+        note = Note(source, title, text, on_click, level, act.ts)
+        if self.hold.offer(note):
+            log.info("notify held source=%s level=%s", source, level)  # 種類だけ(INV-7)
+            return
+        log.info("notify source=%s level=%s", source, level)
+        self._show_note(note)
+
+    def _show_note(self, n: Note) -> None:
         style = str(self.settings.host().get("notification_style", "toast"))
-        accent = "#7C8CFF" if source == "host" else catalog.info(source).accent
-        glyph = None if source == "host" else catalog.info(source).glyph
+        accent = "#7C8CFF" if n.source == "host" else catalog.info(n.source).accent
+        glyph = None if n.source == "host" else catalog.info(n.source).glyph
         if style == "balloon":
-            self._last_balloon_cb = on_click
-            self.tray.show_balloon(f"{self.title_of(source)}: {title}", text)
+            self._last_balloon_cb = n.on_click
+            self.tray.show_balloon(f"{self.title_of(n.source)}: {n.title}", n.text)
         else:
-            self.toasts.show(self.title_of(source), accent, title, text, on_click, level, glyph if level == "info" else None)
+            self.toasts.show(self.title_of(n.source), accent, n.title, n.text, n.on_click, n.level,
+                             glyph if n.level == "info" else None)
+
+    def _summary_note(self, held: list[Note], total: int) -> Note:
+        log.info("notify held summary count=%d", total)
+        return summary_note(held, total, self.title_of, lambda: self.show_window("home"))
+
+    def _foreground_busy(self) -> bool:
+        """通知を保留すべき前面か(ゲーム・全画面)。全画面か判定できないときは Windows の通知状態で決める。"""
+        fg = query_foreground(self.settings.game_processes(), str(self.settings.host().get("fullscreen_detection", "rect")))
+        if fg.exe == "deskkit":
+            return False
+        if fg.is_game or fg.is_fullscreen is True or fg.quns in _QUNS_HOLD:
+            return True
+        return fg.is_fullscreen is None and fg.quns == "busy"
+
+    def open_activity(self, a: Activity) -> None:
+        """「最近の通知」の行クリック。10 分以内で送り主が動いていれば元の動作、それ以外は送り主の画面を開く。"""
+        fresh = (a.on_click is not None and _dt.datetime.now() - a.ts <= ACTIVITY_CLICK_TTL
+                 and (a.alive is None or a.alive()))
+        if fresh and a.on_click is not None:
+            try:
+                a.on_click()
+                return
+            except Exception:  # noqa: BLE001
+                log.exception("通知クリックの処理で例外")
+        self.show_window(a.source if a.source in catalog.MODULE_NAMES else "home")
 
     def _balloon_clicked(self) -> None:
         cb, self._last_balloon_cb = self._last_balloon_cb, None
@@ -184,12 +255,76 @@ class Host:
     def refresh_badge(self) -> None:
         stopped = [s.name for s in self.loader.slots.values() if s.state == "stopped"]
         running = [s.name for s in self.loader.slots.values() if s.state == "running"]
+        snooze = self.snooze.status_text() if hasattr(self, "snooze") else ""
+        suffix = f"\n{snooze}" if snooze else ""
         if stopped:
             tip = f"{APP_NAME} — 停止中: " + ", ".join(self.title_of(n) for n in stopped)
-            self.tray.set_badge("error", tip)
+            self.tray.set_badge("error", tip + suffix)
         else:
             tip = f"{APP_NAME} — " + (", ".join(self.title_of(n) for n in running) + " 動作中" if running else "モジュール未使用")
-            self.tray.set_badge(None, tip)
+            self.tray.set_badge("paused" if snooze else None, tip + suffix)
+
+    # ---- 一時停止(H2)
+    def snooze_for(self, minutes: int | None) -> None:
+        """minutes 分(None は再開するまで)一時停止する。自動で動く処理だけが止まる。"""
+        self.snooze.snooze(minutes)
+        self.notify("host", "一時停止しました", self.snooze.status_text() + "\n手で行う操作はそのまま使えます", None, level="ok")
+
+    def resume(self) -> None:
+        was = self.snooze.manual_active()
+        self.snooze.resume()
+        if was:
+            self.notify("host", "一時停止を終わりました", "自動の処理を再開します", None, level="ok")
+
+    def _snooze_changed(self) -> None:
+        payload = self.snooze.payload()
+        log.info("snooze changed snoozed=%s timed=%s", payload["snoozed"], payload["until"] is not None)
+        self.events.emit("host", "host.snooze_changed", payload)
+        self.tray.set_snooze(self.snooze.manual_active(), self.snooze.status_text())
+        self.refresh_badge()
+        self.signals.snooze_changed.emit()
+        if self.snooze.auto_resumed:
+            self.snooze.auto_resumed = False
+            self.notify("host", "一時停止を終わりました", "予定の時間になったので、自動の処理を再開します", None, level="ok")
+
+    # ---- 設定の世代(H3)
+    def snapshot_now(self) -> Snapshot | None:
+        self._snap_timer.stop()
+        try:
+            snap = self.snapshots.save_file(self.settings.path)
+        except OSError:
+            log.exception("設定の世代を保存できません")
+            return None
+        if snap is not None:
+            log.info("settings snapshot saved")
+            self.signals.snapshots_changed.emit()
+        return snap
+
+    def restore_snapshot(self, snap: Snapshot) -> None:
+        """今の設定を1世代残してから snap の内容で置き換え、再読み込みする。失敗は SettingsError / OSError。"""
+        data = self.snapshots.read(snap)
+        self.snapshot_now()
+        self.settings.replace_all(data)
+        self.snapshot_now()
+        self.reload()
+
+    # ---- 診断(H4)
+    def diagnostics_report(self) -> str:
+        from deskkit.diagnostics import build_report
+
+        return build_report(self)
+
+    def copy_diagnostics(self) -> None:
+        from PySide6.QtGui import QGuiApplication
+
+        try:
+            text = self.diagnostics_report()
+        except Exception as e:  # noqa: BLE001
+            log.exception("診断レポートを作れません")
+            self.notify("host", "診断レポートを作れませんでした", type(e).__name__, None, level="error")
+            return
+        QGuiApplication.clipboard().setText(text)
+        self.notify("host", "診断レポートをコピーしました", "パス・ユーザー名・本文は含みません。貼り付けて共有できます", None, level="ok")
 
     # ---- トレイの共通項目
     def open_settings_file(self) -> None:
@@ -217,10 +352,12 @@ class Host:
             return
         self.loader.stop_all()
         self.hotkeys.unregister_all()
+        self.snooze.sync_settings()
         self.loader.load_all()
         self.register_host_hotkeys()
         self.after_hotkey_registration()
         self.signals.settings_reloaded.emit()
+        self.signals.settings_replaced.emit()
         self.notify("host", "設定を再読み込みしました", "", None, level="ok")
 
     def set_module_enabled(self, name: str, enabled: bool) -> None:
@@ -301,6 +438,8 @@ class Host:
 
     def _shutdown(self) -> None:
         log.info("終了処理")
+        if self._snap_timer.isActive():
+            self.snapshot_now()
         self.loader.stop_all()
         self.hotkeys.unregister_all()
         self.native.close_native()

@@ -133,6 +133,21 @@ class FakeCtx:
         self.errors: list[str] = []
         self._timers: list[Any] = []
         self.quick: list[SimpleNamespace] = []
+        self.snoozed = False
+        self.modes: list[tuple[str, str]] = []
+        self.handlers: dict[str, list[Callable[[Any], None]]] = {}
+
+    # ---- v0.2 の ctx API(INTERFACES_v0.2 §1)
+    def is_snoozed(self) -> bool:
+        return self.snoozed
+
+    def list_modes(self) -> list[tuple[str, str]]:
+        return list(self.modes)
+
+    def fire(self, event: str, payload: dict[str, Any]) -> None:
+        """テスト用: 登録済みの受信側にイベントを配る(本体の EventBus と同じく safe を通す)。"""
+        for h in self.handlers.get(event, []):
+            h(dict(payload))
 
     def add_quick_action(self, label: str, callback: Callable[[], None], *, keywords: str = "", glyph: str | None = None,
                          enabled: Callable[[], bool] | None = None) -> None:
@@ -189,7 +204,7 @@ class FakeCtx:
         pass
 
     def on(self, event: str, handler: Callable[[Any], None]) -> None:
-        pass
+        self.handlers.setdefault(event, []).append(self.safe(handler, f"event:{event}"))
 
     def safe(self, fn: Callable[..., Any], label: str | None = None) -> Callable[..., Any]:
         def w(*a: Any, **k: Any) -> Any:

@@ -1,5 +1,5 @@
 # モード編集画面: モードの作成・名前変更・複製・削除(確認あり)・並べ替えと、モードごとのアクション列の追加
-# (8種類のメニュー)・並べ替え・種別ごとの入力フォームでの編集。検証エラーはモードごとにその場で表示する(FR-1)。
+# (10種類のメニュー)・並べ替え・種別ごとの入力フォームでの編集。検証エラーはモードごとにその場で表示する(FR-1)。
 # 保存は ctx.write_settings 経由。定義が変わればハッシュが変わるので、そのモードは自動で「未確認」に戻る。
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from deskkit.modules.modeshift.actions.theme import THEME_LABELS, theme_text
 from deskkit.modules.modeshift.config import (
     NAME_RE,
     definition_hash,
@@ -62,6 +63,8 @@ TYPE_HINTS: dict[str, str] = {
     "open_path": "フォルダやファイルを既定のアプリで開く",
     "open_url": "http / https の URL を既定のブラウザで開く",
     "layout_apply": "LayoutKeep に配置の適用を頼む(送るだけ)",
+    "mic_volume": "既定の録音デバイス(マイク)の音量・ミュート",
+    "theme": "アプリ(と Windows)のダーク/ライトを切り替える",
 }
 
 
@@ -75,6 +78,8 @@ def default_action(t: str) -> dict[str, Any]:
         "open_path": {"type": t, "path": ""},
         "open_url": {"type": t, "url": "https://"},
         "layout_apply": {"type": t, "layout": None, "wait_s": 0},
+        "mic_volume": {"type": t, "level": None, "mute": True},
+        "theme": {"type": t, "apps": "dark", "system": None},
     }
     return table[t]
 
@@ -93,10 +98,12 @@ def action_summary(a: dict[str, Any], schemes: list[PowerScheme] | None = None) 
             if s.guid == g.lower():
                 return f"{s.name}  ({g})"
         return g or "(未選択)"
-    if t == "master_volume":
+    if t in ("master_volume", "mic_volume"):
         lv = a.get("level")
         mu = a.get("mute")
         return ("音量はそのまま" if lv is None else pct(float(lv))) + ("" if mu is None else ("  ・ミュート" if mu else "  ・ミュート解除"))
+    if t == "theme":
+        return theme_text(a.get("apps"), a.get("system"))
     if t == "app_volume":
         return f"{a.get('exe') or '(exe 未指定)'}  ・{pct(float(a.get('level') or 0))}"
     if t == "open_path":
@@ -104,7 +111,8 @@ def action_summary(a: dict[str, Any], schemes: list[PowerScheme] | None = None) 
     if t == "open_url":
         return safe_url(str(a.get("url") or ""))
     if t == "layout_apply":
-        return (a.get("layout") or "(既定のレイアウト)") + (f"  ・{float(a.get('wait_s') or 0):g} 秒待ち" if a.get("wait_s") else "")
+        return ((a.get("layout") or "(既定のレイアウト)") + (f"  ・プリセット「{a.get('preset')}」" if a.get("preset") else "")
+                + (f"  ・{float(a.get('wait_s') or 0):g} 秒待ち" if a.get("wait_s") else ""))
     return f"未知の種別 {t}"
 
 
@@ -335,6 +343,32 @@ class ActionDialog(W.StyledDialog):
         self._getters.append(lambda d: d.__setitem__("guid", str(combo.currentData() or "")))
 
     def _form_master_volume(self) -> None:
+        self._endpoint_form("マスター音量", "Windows の音量表示(0〜100)を 0.0〜1.0 のスカラーとして保存します。")
+
+    def _form_mic_volume(self) -> None:
+        self._endpoint_form("マイクの音量", "既定の録音デバイス(サウンド設定の「入力」)の音量です。0.0〜1.0 のスカラーとして保存します。")
+        self.body.addWidget(W.label("会議の前にミュートを解除する・作業中はミュートする、のように使えます。元に戻すで切替前の状態に戻ります。",
+                                    "Mute", wrap=True))
+
+    def _form_theme(self) -> None:
+        def combo(key: str, keep_text: str) -> QComboBox:
+            c = QComboBox()
+            c.addItem(keep_text, None)
+            for v in ("dark", "light"):
+                c.addItem(THEME_LABELS[v], v)
+            c.setCurrentIndex(max(0, c.findData(self.a.get(key))))
+            c.currentIndexChanged.connect(guard(lambda _i: self._validate()))
+            return c
+
+        apps = combo("apps", "変えない")
+        self._row("アプリ", apps, "設定アプリ・エクスプローラーなど、アプリのダーク/ライト(「既定のアプリ モード」)。")
+        system = combo("system", "変えない")
+        self._row("Windows(任意)", system, "タスクバー・スタートメニューなどのダーク/ライト(「既定の Windows モード」)。")
+        self.body.addWidget(W.label("変更を開いているアプリへ知らせます。反映されないアプリは再起動すると切り替わります。ゲーム中は切り替えません。",
+                                    "Mute", wrap=True))
+        self._getters.append(lambda d: d.update(apps=apps.currentData(), system=system.currentData()))
+
+    def _endpoint_form(self, title: str, hint: str) -> None:
         use = QCheckBox("音量を変える")
         lv = self.a.get("level")
         use.setChecked(lv is not None)
@@ -347,7 +381,7 @@ class ActionDialog(W.StyledDialog):
         use.toggled.connect(guard(on_use))
         sl.changed.connect(guard(self._validate))
         self.body.addWidget(use)
-        self._row("マスター音量", sl, "Windows の音量表示(0〜100)を 0.0〜1.0 のスカラーとして保存します。")
+        self._row(title, sl, hint)
         mute = QComboBox()
         for text, v in (("ミュートは変えない", None), ("ミュートする", True), ("ミュートを解除する", False)):
             mute.addItem(text, v)
@@ -390,13 +424,25 @@ class ActionDialog(W.StyledDialog):
         name = QLineEdit(str(self.a.get("layout") or ""))
         name.setPlaceholderText("空欄なら既定のレイアウト")
         self._row("レイアウト名(LayoutKeep)", name)
+        preset = QLineEdit(str(self.a.get("preset") or ""))
+        preset.setPlaceholderText("空欄ならプリセットを指定しない")
+        preset.textChanged.connect(guard(lambda _t: self._validate()))
+        self._row("プリセット名(任意)", preset,
+                  "LayoutKeep が今のモニター構成で、この名前のプリセットを探して適用します。見つからなければ何もしません。")
         ws = QDoubleSpinBox()
         ws.setRange(0, 600)
         ws.setDecimals(1)
         ws.setSuffix(" 秒")
         ws.setValue(float(self.a.get("wait_s") or 0))
         self._row("待ち秒数", ws, "直前の手順でアプリを起動したとき、ウィンドウが出るまで LayoutKeep に待ってもらう秒数。")
-        self._getters.append(lambda d: d.update(layout=name.text().strip() or None, wait_s=float(ws.value())))
+        def put(d: dict[str, Any]) -> None:
+            d.update(layout=name.text().strip() or None, wait_s=float(ws.value()))
+            if preset.text().strip():
+                d["preset"] = preset.text().strip()
+            else:
+                d.pop("preset", None)   # 未指定はキーを持たない(定義ハッシュを変えない)
+
+        self._getters.append(put)
 
     # 検証と確定
     def collect(self) -> dict[str, Any]:

@@ -54,8 +54,9 @@ class Applier:
         self.store = store
 
     def apply(self, plan: Plan, *, dry_run: bool, append_undo: bool = False,
-              only: Sequence[int] | None = None) -> ApplyResult:
-        """only を渡すと、その添字の項目だけ動かす(wait_s の再試行用)。append_undo で既存の undo.json に足す。"""
+              only: Sequence[int] | None = None, undo_tag: str | None = None) -> ApplyResult:
+        """only を渡すと、その添字の項目だけ動かす(wait_s の再試行・新規ウィンドウの配置用)。
+        append_undo で既存の undo.json に足す。undo_tag は undo.json に残す起点の印(新規ウィンドウの配置は "place")。"""
         moves = [m for m in plan.moves if only is None or m.index in only]
         skipped = dict(plan.skipped())
         if dry_run:
@@ -81,6 +82,8 @@ class Applier:
                 skipped[k] = skipped.get(k, 0) + v
             return ApplyResult("nothing", 0, skipped)
         data: dict[str, Any] = {"schema": 1, "signature": plan.signature, "created_at": now_iso(), "windows": rows}
+        if undo_tag:
+            data["tag"] = undo_tag
         if append_undo:
             prev = self.store.read_undo()
             if prev and prev.get("signature") == plan.signature:

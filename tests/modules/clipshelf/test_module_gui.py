@@ -134,6 +134,29 @@ def test_clear_all_from_module(module_factory: Any, monkeypatch: pytest.MonkeyPa
     assert op["deleted"] == 3 and op["pins_deleted"] is False
 
 
+def test_clear_all_clears_undecryptable_warning(module_factory: Any, qapp: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from deskkit.ui import widgets
+
+    m, ctx, api, _ = module_factory({"mode": "record"})
+    _copy(m, api, "x")
+    m.store._db().execute("INSERT INTO items (kind, created_at, last_used_at, pinned, payload) VALUES "
+                          "('history', '2026-01-01T00:00:00+09:00', '2026-01-01T00:00:00+09:00', 0, x'00')")
+    m.store.close()
+    m.store.open()
+    assert m.counts()["undecryptable"] == 1
+    page = m.create_page()
+    page._refresh()
+    assert page.store_pill.isVisibleTo(page) and "復号できない" in page.store_pill.text()
+    seen: list[str] = []
+    monkeypatch.setattr(widgets, "confirm", lambda _p, _t, text, **k: (seen.append(text), (True, [False, False]))[1])
+    m.clear_all_interactive(None)
+    assert "復号できない履歴 1 件も削除します" in seen[0]
+    assert m.counts()["undecryptable"] == 0 and m.store.row_count() == 0
+    page._refresh()
+    assert not page.store_pill.isVisibleTo(page)
+    page.close()
+
+
 def test_plain_text_hotkey_and_pause(module_factory: Any) -> None:
     m, ctx, api, _ = module_factory({"mode": "record", "hotkeys": {"open_palette": "Ctrl+Alt+V", "plain_text": "Ctrl+Alt+T",
                                                                     "toggle_pause": "Ctrl+Alt+P"}})

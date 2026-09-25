@@ -156,6 +156,7 @@ class ModeShiftService:
         self._busy_lock = threading.Lock()
         self._listeners: list[Callable[[], None]] = []
         self.running_plan: Plan | None = None
+        self.last_result = "none"   # 診断用: 直前の実行の結果コード(none / ok / partial / error)
         self.config: Config = validate_section(ctx.settings_dict(), ctx.game_processes())
 
     # ---------------------------------------------------------------- 基本
@@ -353,7 +354,8 @@ class ModeShiftService:
             return self._busy_reply()
 
         def job() -> Plan:
-            return undo.build_undo_plan(snap, self.backends, source=source, dry_run=dry_run or want_preview)
+            return undo.build_undo_plan(snap, self.backends, source=source, dry_run=dry_run or want_preview,
+                                        in_game=in_game)
 
         if interactive or source == "auto":
             def done(res: Any) -> None:
@@ -457,8 +459,10 @@ class ModeShiftService:
     def _finish(self, plan: Plan, res: Any) -> None:
         try:
             if isinstance(res, _Failed):
+                self.last_result = "error"
                 self._notify(f"実行中に例外が起きました({type(res.exc).__name__})", "error")
                 return
+            self.last_result = "partial" if plan.exit_code() else "ok"
             c = plan.counts()
             if plan.kind == "switch":
                 self.state.data.update(current_mode=plan.mode, last_switch_at=now_iso(), last_run_id=plan.run_id)
@@ -480,6 +484,11 @@ class ModeShiftService:
                 self.state.data.update(current_mode=plan.extra.get("mode_from"), last_switch_at=now_iso(),
                                        last_run_id=plan.run_id)
                 self.state.save()
+                # 契約 §2: 元に戻す(手動・自動切替の on_exit・CLI)が終わった。mode は戻す前のモード名
+                try:
+                    self.ctx.emit("modeshift.reverted", {"mode": plan.mode, "run_id": plan.run_id})
+                except Exception:  # noqa: BLE001
+                    log.exception("modeshift.reverted を送れません")
                 head = f"「{plan.label}」の適用前へ戻しました" if plan.steps else "戻す項目はありませんでした"
             self._notify(self._summary(plan, head), "warn" if plan.exit_code() else "ok")
         finally:

@@ -1,5 +1,5 @@
-# 検索パレット(枠なし・角丸・影・フェード+スライド)。検索欄+タブ(履歴 / 定型文)+独自描画の一覧+プレビュー+キー案内。
-# キー操作は Qt のウィンドウ内イベントだけで読む(グローバルなフックは使わない。C-3 / FR-11)。
+# 検索パレット(枠なし・角丸・影・フェード+スライド)。検索欄+タブ(履歴 / 定型文)+独自描画の一覧+プレビュー+キー案内、
+# 定型文の入力欄フォーム(C1)と変換して貼り付け(C2)のシート。キー操作は Qt のウィンドウ内イベントだけで読む(C-3 / FR-11)。
 # 本文を画面に出すのはこのパレットだけ。ここからログへ本文を書かない(例外時もトレースバックだけ)。
 from __future__ import annotations
 
@@ -31,12 +31,18 @@ from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QGuiApplication,
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListView,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
     QPlainTextEdit,
+    QScrollArea,
     QStackedWidget,
     QStyle,
     QStyledItemDelegate,
@@ -45,7 +51,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from deskkit.modules.clipshelf import transforms
 from deskkit.modules.clipshelf.editor import edit_snippet_dialog
+from deskkit.modules.clipshelf.snippets import FIELD_SELECT, Field
 from deskkit.modules.clipshelf.store import KIND_SNIPPET, Item
 from deskkit.ui import theme as T
 from deskkit.ui import widgets as W
@@ -58,6 +66,7 @@ _log = logging.getLogger("deskkit.clipshelf.palette")
 F = TypeVar("F", bound=Callable[..., Any])
 ROLE_ITEM = int(Qt.ItemDataRole.UserRole) + 1
 TAB_HISTORY, TAB_SNIPPETS = 0, 1
+SHEET_LIST, SHEET_FORM, SHEET_TRANSFORM = 0, 1, 2
 PANEL_W, PANEL_H, SHADOW_MARGIN = 900, 560, 30
 
 
@@ -397,6 +406,10 @@ class Palette(QWidget):
         self._modal = False
         self._closing = False
         self._anim: QParallelAnimationGroup | None = None
+        # 入力フォーム・変換の選択の途中状態(値はメモリだけ。閉じる・戻るときに消す)
+        self._pending_item: Item | None = None
+        self._pending_transform: str | None = None
+        self._form_widgets: list[tuple[Field, QLineEdit | QComboBox]] = []
         self.resize(PANEL_W + SHADOW_MARGIN * 2, PANEL_H + SHADOW_MARGIN * 2)
         self._build()
         self.m.notifier.changed.connect(self._on_module_changed)
@@ -444,8 +457,10 @@ class Palette(QWidget):
         trow.addWidget(self.state_pill, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addLayout(trow)
 
-        # 一覧+プレビュー
-        body = QHBoxLayout()
+        # 一覧+プレビュー(シート 0)/入力フォーム(シート 1)/変換の選択(シート 2)
+        body_w = QWidget()
+        body = QHBoxLayout(body_w)
+        body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(14)
         self.model = ItemModel()
         self.view = QListView()
@@ -464,7 +479,11 @@ class Palette(QWidget):
         self.list_stack.addWidget(self.empty)
         body.addWidget(self.list_stack, 1)
         body.addWidget(self._build_preview())
-        lay.addLayout(body, 1)
+        self.sheets = QStackedWidget()
+        self.sheets.addWidget(body_w)
+        self.sheets.addWidget(self._build_form_sheet())
+        self.sheets.addWidget(self._build_transform_sheet())
+        lay.addWidget(self.sheets, 1)
 
         lay.addWidget(W.divider())
         # フッター(キー案内)
@@ -485,8 +504,11 @@ class Palette(QWidget):
         self.tabs.changed.connect(guard(lambda _i: self._on_tab_changed()))
         self.view.selectionModel().currentChanged.connect(guard(lambda *_a: self._update_preview()))
         self.view.doubleClicked.connect(guard(lambda _i: self._choose_current()))
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(guard(self._show_context_menu))
         self.search.installEventFilter(self)
         self.view.installEventFilter(self)
+        self.tf_list.installEventFilter(self)
         self._update_hints()
 
     def _build_preview(self) -> QWidget:
@@ -526,6 +548,96 @@ class Palette(QWidget):
         lay.addWidget(self.pv_meta)
         return pane
 
+    def _sheet_frame(self, name: str) -> tuple[QFrame, QVBoxLayout]:
+        pane = QFrame()
+        pane.setObjectName(name)
+        pane.setStyleSheet(f"QFrame#{name} {{ background: {T.SURFACE}; border: 1px solid {T.BORDER}; border-radius: 13px; }}")
+        lay = QVBoxLayout(pane)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(10)
+        return pane, lay
+
+    def _sheet_preview(self) -> QPlainTextEdit:
+        pv = QPlainTextEdit()
+        pv.setReadOnly(True)
+        pv.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        pv.setFixedWidth(340)
+        pv.setStyleSheet(f"QPlainTextEdit {{ background: {T.SURFACE2}; border: 1px solid {T.BORDER}; border-radius: 9px;"
+                         f" font-size: 12px; padding: 6px; }}")
+        return pv
+
+    def _build_form_sheet(self) -> QWidget:
+        """定型文の {input:…} / {select:…} に値を入れる小さなフォーム(v0.2 C1)。キーボードだけで完結する。"""
+        pane, lay = self._sheet_frame("FormPane")
+        head = QHBoxLayout()
+        head.addWidget(W.Glyph(G.EDIT, 16, self.accent))
+        self.form_title = W.label("", "H3")
+        self.form_title.setTextFormat(Qt.TextFormat.PlainText)
+        head.addWidget(self.form_title, 1)
+        self.form_pill = W.StatusPill("", "info")
+        head.addWidget(self.form_pill)
+        lay.addLayout(head)
+        lay.addWidget(W.label("貼り付ける前に値を入れてください。入れた値は保存しません。", "Mute", wrap=True))
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        host = QWidget()
+        self.form_grid = QGridLayout(host)
+        self.form_grid.setContentsMargins(0, 0, 0, 0)
+        self.form_grid.setHorizontalSpacing(12)
+        self.form_grid.setVerticalSpacing(10)
+        scroll = QScrollArea()
+        scroll.setWidget(host)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        row.addWidget(scroll, 1)
+        right = QVBoxLayout()
+        right.setSpacing(6)
+        right.addWidget(W.label("貼り付ける内容", "Eyebrow"))
+        self.form_preview = self._sheet_preview()
+        right.addWidget(self.form_preview, 1)
+        row.addLayout(right)
+        lay.addLayout(row, 1)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        btns.addWidget(W.button("戻る", "ghost", G.UNDO, on_click=guard(self._back_to_list), tooltip="一覧に戻る(Esc)"))
+        btns.addWidget(W.button("貼り付け", "primary", G.PASTE, on_click=guard(self._submit_form), tooltip="Enter"))
+        lay.addLayout(btns)
+        return pane
+
+    def _build_transform_sheet(self) -> QWidget:
+        """変換して貼り付け(v0.2 C2)の選択。利用者が選んだ1回だけ変換する(自動では変換しない。INV-8)。"""
+        pane, lay = self._sheet_frame("TransformPane")
+        head = QHBoxLayout()
+        head.addWidget(W.Glyph(G.FILTER, 16, self.accent))
+        self.tf_title = W.label("変換して貼り付け", "H3")
+        head.addWidget(self.tf_title, 1)
+        lay.addLayout(head)
+        lay.addWidget(W.label("変換した結果をクリップボードに置きます。元の履歴・定型文は変わりません。", "Mute", wrap=True))
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        self.tf_list = QListWidget()
+        self.tf_list.setStyleSheet(
+            f"QListWidget {{ background: transparent; border: none; font-size: 14px; }}"
+            f"QListWidget::item {{ padding: 8px 10px; border-radius: 8px; }}"
+            f"QListWidget::item:selected {{ background: {T.alpha(self.accent, 0.18)}; color: {T.TEXT}; }}"
+        )
+        for i, (tid, label, _fn) in enumerate(transforms.TRANSFORMS):
+            li = QListWidgetItem(f"{i + 1}    {label}")
+            li.setData(Qt.ItemDataRole.UserRole, tid)
+            self.tf_list.addItem(li)
+        self.tf_list.currentRowChanged.connect(guard(lambda _r: self._update_transform_preview()))
+        self.tf_list.itemActivated.connect(guard(lambda _it: self._apply_transform()))
+        row.addWidget(self.tf_list, 1)
+        right = QVBoxLayout()
+        right.setSpacing(6)
+        right.addWidget(W.label("変換後", "Eyebrow"))
+        self.tf_preview = self._sheet_preview()
+        right.addWidget(self.tf_preview, 1)
+        row.addLayout(right)
+        lay.addLayout(row, 1)
+        return pane
+
     # ------------------------------------------------------------ 開閉
     def open_for(self, target_rect: tuple[int, int, int, int] | None, tab: int = TAB_HISTORY) -> None:
         screen = self._pick_screen(target_rect)
@@ -536,6 +648,7 @@ class Palette(QWidget):
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
+        self._reset_sheets()
         self.tabs.set_index(tab, emit=False)
         self._on_tab_changed()
         self._closing = False
@@ -587,6 +700,7 @@ class Palette(QWidget):
             if self._anim is not None:
                 self._anim.stop()
             self.hide()
+            self._reset_sheets()
             return
         self._closing = True
         self._animate(self.pos() + QPoint(0, 10), 0.0, 120, self._finish_hide)
@@ -595,6 +709,7 @@ class Palette(QWidget):
         self._closing = False
         self.hide()
         self.setWindowOpacity(1.0)
+        self._reset_sheets()
 
     # ------------------------------------------------------------ Qt 仮想メソッド(すべて例外を握る)
     def eventFilter(self, obj: QObject, e: QEvent) -> bool:  # noqa: N802
@@ -631,8 +746,14 @@ class Palette(QWidget):
 
     # ------------------------------------------------------------ キー操作(FR-11)
     def _on_key(self, e: QKeyEvent) -> bool:
+        sheet = self.sheets.currentIndex()
+        if sheet == SHEET_FORM:
+            return self._on_form_key(e)
+        if sheet == SHEET_TRANSFORM:
+            return self._on_transform_key(e)
         key = e.key()
         ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
         if key == Qt.Key.Key_Escape:
             self.dismiss()
             return True
@@ -640,7 +761,10 @@ class Palette(QWidget):
             self.tabs.set_index(1 - self.tabs.index())
             return True
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._choose_current()
+            if shift:
+                self._open_transform()  # Shift+Enter: 変換して貼り付け(C2)
+            else:
+                self._choose_current()
             return True
         if key in (Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
             step = {Qt.Key.Key_Up: -1, Qt.Key.Key_Down: 1, Qt.Key.Key_PageUp: -6, Qt.Key.Key_PageDown: 6}[Qt.Key(key)]
@@ -682,7 +806,204 @@ class Palette(QWidget):
     def _choose_current(self) -> None:
         item = self.current_item()
         if item is not None:
-            self.m.choose(item)
+            self._paste(item, None)
+
+    def _paste(self, item: Item, transform: str | None) -> None:
+        """聞く欄がある定型文ならフォームを出し、無ければそのまま貼り付ける。"""
+        if self.m.snippet_fields(item):
+            self._open_form(item, transform)
+        else:
+            self.m.choose(item, transform=transform)
+
+    # ------------------------------------------------------------ シート(入力フォーム・変換の選択)
+    def _show_sheet(self, index: int) -> None:
+        self.sheets.setCurrentIndex(index)
+        self._update_hints()
+
+    def _reset_sheets(self) -> None:
+        """フォームの値と途中状態を捨てて一覧に戻す(入れた値をメモリの部品に残さない)。"""
+        self._pending_item = None
+        self._pending_transform = None
+        self._clear_form()
+        self.form_preview.setPlainText("")
+        self.tf_preview.setPlainText("")
+        if self.sheets.currentIndex() != SHEET_LIST:
+            self._show_sheet(SHEET_LIST)
+
+    def _back_to_list(self) -> None:
+        self._reset_sheets()
+        self.search.setFocus()
+
+    def _clear_form(self) -> None:
+        for _f, w in self._form_widgets:
+            if isinstance(w, QLineEdit):
+                w.clear()
+        self._form_widgets = []
+        while self.form_grid.count():
+            it = self.form_grid.takeAt(0)
+            wdg = it.widget() if it is not None else None
+            if wdg is not None:
+                # 親から外さない(外すと Python 側の参照切れで即座に破棄され、キー処理中の欄を消して落ちる)。
+                # 隠して、イベントループに戻ってから消す
+                wdg.hide()
+                wdg.deleteLater()
+
+    def _open_form(self, item: Item, transform: str | None) -> None:
+        self._clear_form()
+        self._pending_item = item
+        self._pending_transform = transform
+        self.form_title.setText(item.name or "無題の定型文")
+        self.form_pill.set_state(self.accent, f"変換: {transforms.LABELS[transform]}" if transform else "定型文")
+        for row, f in enumerate(self.m.snippet_fields(item)):
+            lab = W.label(f.label, "Dim")
+            lab.setTextFormat(Qt.TextFormat.PlainText)
+            w: QLineEdit | QComboBox
+            if f.kind == FIELD_SELECT:
+                w = QComboBox()
+                w.addItems(list(f.options))
+                w.currentIndexChanged.connect(guard(lambda _i: self._update_form_preview()))
+            else:
+                w = QLineEdit(f.default)
+                w.setPlaceholderText(f.label)
+                w.textChanged.connect(guard(lambda _t: self._update_form_preview()))
+            w.setMinimumHeight(34)
+            w.installEventFilter(self)
+            self.form_grid.addWidget(lab, row, 0, Qt.AlignmentFlag.AlignVCenter)
+            self.form_grid.addWidget(w, row, 1)
+            self._form_widgets.append((f, w))
+        self.form_grid.setRowStretch(len(self._form_widgets), 1)
+        self.form_grid.setColumnStretch(1, 1)
+        self._show_sheet(SHEET_FORM)
+        self._update_form_preview()
+        if self._form_widgets:
+            first = self._form_widgets[0][1]
+            first.setFocus()
+            if isinstance(first, QLineEdit):
+                first.selectAll()
+
+    def form_values(self) -> dict[str, str]:
+        return {f.key: (w.currentText() if isinstance(w, QComboBox) else w.text()) for f, w in self._form_widgets}
+
+    def _update_form_preview(self) -> None:
+        item = self._pending_item
+        if item is None:
+            return
+        text = self.m.snippet_preview(item.text, self.form_values()).text
+        if self._pending_transform:
+            text = transforms.apply(self._pending_transform, text)
+        self.form_preview.setPlainText(text)
+
+    def _submit_form(self) -> None:
+        item, transform = self._pending_item, self._pending_transform
+        if item is None:
+            return
+        values = self.form_values()
+        self._reset_sheets()  # 値はここで部品から消す(choose に渡す分だけが残る)
+        self.m.choose(item, values=values, transform=transform)
+
+    def _focus_next_field(self, step: int) -> None:
+        ws = [w for _f, w in self._form_widgets]
+        if not ws:
+            return
+        fw = self.focusWidget()  # 窓が非アクティブでも「この窓で次にフォーカスを持つ部品」が分かる
+        cur = next((i for i, w in enumerate(ws) if w is fw), -1)
+        nxt = ws[(cur + step) % len(ws)] if cur >= 0 else ws[0]
+        nxt.setFocus()
+        if isinstance(nxt, QLineEdit):
+            nxt.selectAll()
+
+    def _on_form_key(self, e: QKeyEvent) -> bool:
+        key = e.key()
+        if key == Qt.Key.Key_Escape:
+            self._back_to_list()
+            return True
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._submit_form()
+            return True
+        if key == Qt.Key.Key_Tab and not (e.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            self._focus_next_field(1)
+            return True
+        if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+            self._focus_next_field(-1)
+            return True
+        return False  # 文字入力・選択欄の ↑↓ はそのまま部品に渡す
+
+    def _open_transform(self, item: Item | None = None) -> None:
+        item = item or self.current_item()
+        if item is None:
+            return
+        self._pending_item = item
+        self._pending_transform = None
+        self.tf_title.setText(f"変換して貼り付け — {title_and_sub(item)[0]}")
+        self._show_sheet(SHEET_TRANSFORM)
+        self.tf_list.setCurrentRow(0)
+        self.tf_list.setFocus()
+        self._update_transform_preview()
+
+    def _current_transform(self) -> str | None:
+        li = self.tf_list.currentItem()
+        return str(li.data(Qt.ItemDataRole.UserRole)) if li is not None else None
+
+    def _update_transform_preview(self) -> None:
+        item, tid = self._pending_item, self._current_transform()
+        if item is None or tid is None:
+            return
+        base = self.m.snippet_preview(item.text).text if item.kind == KIND_SNIPPET else item.text
+        out = transforms.apply(tid, base)
+        self.tf_preview.setPlainText(out if len(out) <= 20000 else out[:20000] + "\n…(以下省略)")
+
+    def _apply_transform(self, tid: str | None = None) -> None:
+        item = self._pending_item
+        tid = tid or self._current_transform()
+        if item is None or tid is None:
+            return
+        self._reset_sheets()
+        self._paste(item, tid)
+
+    def _on_transform_key(self, e: QKeyEvent) -> bool:
+        key = e.key()
+        if key == Qt.Key.Key_Escape:
+            self._back_to_list()
+            return True
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._apply_transform()
+            return True
+        k1 = int(Qt.Key.Key_1)
+        if k1 <= int(key) < k1 + len(transforms.IDS):
+            self._apply_transform(transforms.IDS[int(key) - k1])
+            return True
+        if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            n = self.tf_list.count()
+            self.tf_list.setCurrentRow((self.tf_list.currentRow() + (1 if key == Qt.Key.Key_Down else -1)) % n)
+            return True
+        return True  # ほかのキーは検索欄などに流さない
+
+    # ------------------------------------------------------------ 右クリックメニュー
+    def build_context_menu(self, item: Item) -> QMenu:
+        menu = QMenu(self)
+        menu.addAction("貼り付け\tEnter", guard(lambda: self._paste(item, None)))
+        sub = menu.addMenu("変換して貼り付け\tShift+Enter")
+        for i, (tid, label, _fn) in enumerate(transforms.TRANSFORMS):
+            sub.addAction(f"&{i + 1}  {label}", guard(lambda t=tid: self._paste(item, t)))
+        menu.addSeparator()
+        if item.kind == KIND_SNIPPET:
+            menu.addAction("編集\tCtrl+E", guard(self._edit_current))
+        else:
+            menu.addAction("ピン留めを外す\tCtrl+P" if item.pinned else "ピン留め\tCtrl+P", guard(self._toggle_pin))
+        menu.addAction("削除…\tDel", guard(self._delete_current))
+        return menu
+
+    def _show_context_menu(self, pos: QPoint) -> None:
+        idx = self.view.indexAt(pos)
+        if not idx.isValid():
+            return
+        self._select_row(idx.row())
+        item = self.current_item()
+        if item is None:
+            return
+        menu = self.build_context_menu(item)
+        self._run_modal(lambda: menu.exec(self.view.viewport().mapToGlobal(pos)))
+        menu.deleteLater()
 
     def _toggle_pin(self) -> None:
         item = self.current_item()
@@ -743,7 +1064,8 @@ class Palette(QWidget):
             self._modal = False
             if self.isVisible():
                 self.activateWindow()
-                self.search.setFocus()
+                if self.sheets.currentIndex() == SHEET_LIST:  # フォームを開いたときは最初の欄のフォーカスを奪わない
+                    self.search.setFocus()
 
     # ------------------------------------------------------------ 表示の更新
     def _on_module_changed(self) -> None:
@@ -755,6 +1077,8 @@ class Palette(QWidget):
             _log.exception("palette refresh failed")
 
     def _on_tab_changed(self) -> None:
+        if self.sheets.currentIndex() != SHEET_LIST:
+            self._reset_sheets()  # タブをクリックしたらフォーム・変換の途中は捨てて一覧に戻る
         self._update_hints()
         self.refresh()
 
@@ -781,7 +1105,7 @@ class Palette(QWidget):
         if searching:
             self.empty = W.EmptyState(G.SEARCH, "一致する項目はありません", "語を減らすか、別の語で探してください。")
         elif self.tabs.index() == TAB_SNIPPETS:
-            self.empty = W.EmptyState(G.SPARKLE, "定型文がありません", "Ctrl+N で作れます。{date} {time} {clipboard} が使えます。")
+            self.empty = W.EmptyState(G.SPARKLE, "定型文がありません", "Ctrl+N で作れます。{date} {time} {clipboard} と、貼り付け時に聞く {input:ラベル} {select:A|B|C} が使えます。")
         elif self.m.store is None:
             self.empty = W.EmptyState(G.ERROR, "履歴 DB を開けません", self.m.store_error or "")
         elif self.m.config.mode == "observe":
@@ -795,8 +1119,8 @@ class Palette(QWidget):
     def _update_state_pill(self) -> None:
         if self.m.store is None:
             self.state_pill.set_state("error", "DB エラー")
-        elif self.m.paused:
-            self.state_pill.set_state("off", "一時停止中")
+        elif self.m.pause_reasons():
+            self.state_pill.set_state("off", self.m.status_text())
         elif self.m.config.mode == "observe":
             self.state_pill.set_state("warn", "観察モード(記録しない)")
         else:
@@ -810,17 +1134,24 @@ class Palette(QWidget):
                 wdg.hide()
                 wdg.setParent(None)  # 次のイベントループを待たずに見えなくする
                 wdg.deleteLater()
-        hints = [("↑↓", "移動"), ("Enter", "貼り付け"), ("Tab", "切替"), ("Del", "削除"), ("Esc", "閉じる")]
-        if self.tabs.index() == TAB_HISTORY:
-            hints.insert(2, ("Ctrl+P", "ピン"))
+        sheet = self.sheets.currentIndex()
+        if sheet == SHEET_FORM:
+            hints = [("Tab", "次の欄"), ("Enter", "貼り付け"), ("Esc", "戻る")]
+        elif sheet == SHEET_TRANSFORM:
+            hints = [("↑↓", "選ぶ"), ("1〜6", "すぐ変換"), ("Enter", "変換して貼り付け"), ("Esc", "戻る")]
         else:
-            hints.insert(2, ("Ctrl+N", "新規"))
-            hints.insert(3, ("Ctrl+E", "編集"))
+            hints = [("↑↓", "移動"), ("Enter", "貼り付け"), ("Shift+Enter", "変換"), ("Tab", "切替"), ("Del", "削除"),
+                     ("Esc", "閉じる")]
+            if self.tabs.index() == TAB_HISTORY:
+                hints.insert(3, ("Ctrl+P", "ピン"))
+            else:
+                hints.insert(3, ("Ctrl+N", "新規"))
+                hints.insert(4, ("Ctrl+E", "編集"))
         for k, t in hints:
             self.hints_box.addWidget(_kbd(k, t))
         is_snip = self.tabs.index() == TAB_SNIPPETS
-        self.new_btn.setVisible(is_snip)
-        self.clear_btn.setVisible(not is_snip)
+        self.new_btn.setVisible(is_snip and sheet == SHEET_LIST)
+        self.clear_btn.setVisible(not is_snip and sheet == SHEET_LIST)
 
     def _update_preview(self) -> None:
         item = self.current_item()
@@ -840,8 +1171,9 @@ class Palette(QWidget):
             self.pv_text.setPlainText(exp.text)
             self.pv_warn.setText("\n".join("⚠ " + w for w in exp.warnings))
             self.pv_warn.setVisible(bool(exp.warnings))
-            self.pv_meta.setText(f"最後に使用: {relative_time(item.last_used_at, now)}\n"
-                                 "Enter で展開した結果をクリップボードに置きます")
+            how = ("Enter で値を入れる欄を開き、展開した結果をクリップボードに置きます" if exp.fields
+                   else "Enter で展開した結果をクリップボードに置きます")
+            self.pv_meta.setText(f"最後に使用: {relative_time(item.last_used_at, now)}\n{how}")
             return
         self.pv_kind.set_state("accent" if item.pinned else "info", "ピン留め" if item.pinned else "履歴")
         self.pv_title.setText("")
@@ -849,8 +1181,11 @@ class Palette(QWidget):
         self.pv_text.setPlainText(item.text if len(item.text) <= 20000 else item.text[:20000] + "\n…(以下省略)")
         self.pv_warn.setVisible(False)
         n_lines = item.text.count("\n") + 1
+        expiry = ""
+        if item.expires_at is not None and not item.pinned:
+            expiry = f"\n⏱ {item.expires_at.strftime('%H:%M')} に自動で消えます(短命記録のアプリ。ピン留めで残せます)"
         self.pv_meta.setText(
             f"コピー元: {item.source_exe or '不明'}\n"
             f"作成: {item.created_at.strftime('%Y-%m-%d %H:%M')}  ·  最後に使用: {relative_time(item.last_used_at, now)}\n"
-            f"{len(item.text):,} 文字 · {n_lines} 行"
+            f"{len(item.text):,} 文字 · {n_lines} 行{expiry}"
         )

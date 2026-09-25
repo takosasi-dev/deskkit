@@ -9,7 +9,7 @@ from typing import Any
 
 from .matcher import Match
 from .model import RawMonitor, Rect, rects_intersect
-from .monitors import workspace_offset
+from .monitors import workspace_to_screen
 from .windows import EXCLUDE_LABELS, effective_normal_rect
 
 
@@ -72,14 +72,12 @@ REASONS = {
 
 
 def _on_screen(r: Rect, monitors: Sequence[RawMonitor]) -> bool:
-    ox, oy = workspace_offset(monitors)
-    scr = (r[0] + ox, r[1] + oy, r[2] + ox, r[3] + oy)
+    scr = workspace_to_screen(r, monitors)
     return any(rects_intersect(scr, m.rect) for m in monitors)
 
 
 def make_plan(signature: str, matches: Sequence[Match], monitors: Sequence[RawMonitor]) -> Plan:
     plan = Plan(signature)
-    offset = workspace_offset(monitors)
     for m in matches:
         e = m.entry
         item = PlanItem(index=m.index, exe=e.exe, exe_name=e.exe_name, cls=e.cls, rule=m.rule, action="skip", key=m.status,
@@ -91,7 +89,7 @@ def make_plan(signature: str, matches: Sequence[Match], monitors: Sequence[RawMo
             if w.raw.placement is not None:
                 item.before_show = w.raw.placement.show
                 # スナップ中の窓は今の見た目の矩形で比べる(保存側と同じ規則)
-                item.before_rect = effective_normal_rect(w.raw, offset)[0]
+                item.before_rect = effective_normal_rect(w.raw, monitors)[0]
         if m.status == "matched":
             if not _on_screen(e.normal_rect, monitors):
                 item.key = "excluded:offscreen"

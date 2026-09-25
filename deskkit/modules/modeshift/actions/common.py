@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from deskkit.modules.modeshift.system import Backends, MasterState, PowerScheme, ProcInfo, SessionInfo
+from deskkit.modules.modeshift.system import Backends, MasterState, PowerScheme, ProcInfo, SessionInfo, ThemeState
 
 log = logging.getLogger("deskkit.modeshift")
 
@@ -31,6 +31,8 @@ class PlanEnv:
     _schemes: Any = _UNSET
     _master: Any = _UNSET
     _sessions: Any = _UNSET
+    _capture: Any = _UNSET
+    _theme: Any = _UNSET
     notes: list[str] = field(default_factory=list)
 
     def procs(self) -> list[ProcInfo]:
@@ -93,6 +95,24 @@ class PlanEnv:
                 log.warning("マスター音量を読めません: %s", type(e).__name__)
                 self._master = None
         return self._master  # type: ignore[no-any-return]
+
+    def capture(self) -> MasterState | None:
+        if self._capture is _UNSET:
+            try:
+                self._capture = self.backends.audio.get_capture()
+            except Exception as e:  # noqa: BLE001
+                log.warning("マイクの音量を読めません: %s", type(e).__name__)
+                self._capture = None
+        return self._capture  # type: ignore[no-any-return]
+
+    def theme(self) -> ThemeState | None:
+        if self._theme is _UNSET:
+            try:
+                self._theme = self.backends.theme.get()
+            except Exception as e:  # noqa: BLE001
+                log.warning("テーマを読めません: %s", type(e).__name__)
+                self._theme = None
+        return self._theme  # type: ignore[no-any-return]
 
     def sessions(self) -> list[SessionInfo]:
         if self._sessions is _UNSET:

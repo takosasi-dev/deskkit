@@ -277,6 +277,18 @@ def t_no_url(tmp: Path) -> None:
     assert rec.get("domain") == "dl.example.com" and rec.get("zone_id") == 3, rec
 
 
+def t_template(tmp: Path) -> None:
+    fake, svc, clock = started(tmp, [rule("t", "C:\\Sorted\\{ext}\\{domain}", [".pdf"])])
+    fake.add_file(DL + "\\t.pdf", 10, mtime=clock.t, zone=ZONE3)
+    settle(svc, clock)
+    assert fake.get(DL + "\\t.pdf") is not None and not fake.is_dir("C:\\Sorted"), "基準フォルダを自動で作った"
+    fake.mkdirs("C:\\Sorted")
+    settle(svc, clock)
+    assert fake.names_in("C:\\Sorted\\pdf\\dl.example.com") == ["t.pdf"], fake.dirs
+    assert svc.undo(1).restored and fake.is_dir("C:\\Sorted\\pdf\\dl.example.com"), "undo でフォルダを消した"
+    assert "http" not in svc.oplog.path.read_text(encoding="utf-8")
+
+
 TESTS: list[tuple[str, Callable[[Path], None]]] = [
     ("基準線と sort-existing", t_baseline),
     ("完了判定(一時名・安定・0バイト・使用中)", t_completion),
@@ -289,6 +301,7 @@ TESTS: list[tuple[str, Callable[[Path], None]]] = [
     ("undo", t_undo),
     ("アーカイブ", t_archive),
     ("URL を記録しない", t_no_url),
+    ("移動先テンプレート(基準フォルダの下だけ作る)", t_template),
 ]
 
 

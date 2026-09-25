@@ -33,11 +33,15 @@ class FakeWin32:
     fail_hwnds: dict[int, int] = field(default_factory=dict)  # hwnd → 返す Win32 エラー
     set_calls: list[tuple[int, Placement]] = field(default_factory=list)
     steal_focus: bool = False  # True なら set_placement が foreground を奪う(FR-16 の検査用)
+    elevated_pids: set[int] = field(default_factory=set)  # 昇格しているプロセス
+    unknown_elevation_pids: set[int] = field(default_factory=set)  # 昇格状態を読めないプロセス
+    enum_calls: int = 0  # enum_windows の呼び出し回数(ポーリングの負荷検査用)
 
     def enum_monitors(self) -> list[RawMonitor]:
         return list(self.monitors)
 
     def enum_windows(self) -> list[int]:
+        self.enum_calls += 1
         return [w.hwnd for w in self.windows]
 
     def describe_window(self, hwnd: int) -> RawWindow | None:
@@ -68,3 +72,8 @@ class FakeWin32:
 
     def current_pid(self) -> int:
         return self.pid
+
+    def is_elevated(self, pid: int) -> bool | None:
+        if pid in self.unknown_elevation_pids:
+            return None
+        return pid in self.elevated_pids

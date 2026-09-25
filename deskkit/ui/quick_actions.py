@@ -68,6 +68,14 @@ def collect(host: Host) -> list[Entry]:
     out.append(Entry("設定を再読み込み", APP_NAME, "host", G.REFRESH, host.reload, "リロード"))
     out.append(Entry("アップデートを確認", APP_NAME, "host", G.DOWNLOAD, lambda: host.updates.check(manual=True), "更新 バージョン"))
     out.append(Entry("はじめてガイドを見る", APP_NAME, "host", hg, host.show_onboarding, "チュートリアル 使い方"))
+    # 一時停止(H2)・診断(H4)
+    if host.snooze.manual_active():
+        out.append(Entry("一時停止を終わる(再開)", APP_NAME, "host", G.PLAY, host.resume, "再開 スヌーズ 解除",
+                         "停止中"))
+    for label_, minutes in (("30分", 30), ("1時間", 60), ("再開するまで", None)):
+        out.append(Entry(f"一時停止する({label_})", APP_NAME, "host", G.PAUSE, _call(host.snooze_for, minutes),
+                         "スヌーズ 止める 休止 自動"))
+    out.append(Entry("診断レポートをコピー", APP_NAME, "host", G.COPY, host.copy_diagnostics, "不具合 報告 サポート"))
     # トレイ項目(モジュールが追加したもの)
     for name, mm in list(host.tray._modules.items()):  # noqa: SLF001
         info = catalog.info(name)

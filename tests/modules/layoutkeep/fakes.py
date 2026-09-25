@@ -105,6 +105,16 @@ class FakeCtx:
         self.status = ""
         self.restarts = 0
         self.hotkeys = FakeHotkeys()
+        self.snoozed = False
+        self.modes: list[tuple[str, str]] = []
+
+    def is_snoozed(self) -> bool:
+        """契約 §1: 一時停止(スヌーズ)中か(既定 False)。"""
+        return self.snoozed
+
+    def list_modes(self) -> list[tuple[str, str]]:
+        """契約 §1: ModeShift のモード (name, label) の一覧。"""
+        return list(self.modes)
 
     def settings(self) -> Mapping[str, Any]:
         return MappingProxyType(copy.deepcopy(self.section))

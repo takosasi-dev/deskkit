@@ -15,7 +15,7 @@ from .fakes import make_module
 
 # タスクバーが上にある主モニタ(ワークスペース原点がスクリーンの (0, 40))
 PRIMARY = fake_monitor("\\\\.\\DISPLAY1", (0, 0, 1920, 1080), primary=True, work=(0, 40, 1920, 1080))
-OFFSET = monitors.workspace_offset([PRIMARY])
+MONS = [PRIMARY]
 
 
 def _win(hwnd: int, normal: tuple[int, int, int, int], screen: tuple[int, int, int, int], *, maximized: bool = False):  # type: ignore[no-untyped-def]
@@ -24,21 +24,21 @@ def _win(hwnd: int, normal: tuple[int, int, int, int], screen: tuple[int, int, i
 
 
 def test_offset_is_work_origin_relative_to_monitor() -> None:
-    assert OFFSET == (0, 40)
+    assert monitors.work_offset(PRIMARY) == (0, 40)
 
 
 def test_not_snapped_when_rects_agree_after_conversion() -> None:
-    rect, snapped = effective_normal_rect(_win(1, (100, 100, 500, 500), (100, 140, 500, 540)), OFFSET)
+    rect, snapped = effective_normal_rect(_win(1, (100, 100, 500, 500), (100, 140, 500, 540)), MONS)
     assert (rect, snapped) == ((100, 100, 500, 500), False)
 
 
 def test_snapped_uses_current_rect_in_workspace_coords() -> None:
-    rect, snapped = effective_normal_rect(_win(1, (100, 100, 500, 500), (0, 40, 960, 1080)), OFFSET)
+    rect, snapped = effective_normal_rect(_win(1, (100, 100, 500, 500), (0, 40, 960, 1080)), MONS)
     assert (rect, snapped) == ((0, 0, 960, 1040), True)
 
 
 def test_maximized_is_never_snapped() -> None:
-    rect, snapped = effective_normal_rect(_win(1, (100, 100, 500, 500), (-8, 32, 1928, 1088), maximized=True), OFFSET)
+    rect, snapped = effective_normal_rect(_win(1, (100, 100, 500, 500), (-8, 32, 1928, 1088), maximized=True), MONS)
     assert (rect, snapped) == ((100, 100, 500, 500), False)
 
 
@@ -80,3 +80,57 @@ def test_apply_uses_snapped_rect_via_set_window_placement(tmp_path: Path) -> Non
     # undo には崩れた時点の見た目どおりの矩形が残る
     undo = mod.store.read_undo()
     assert undo is not None and undo["windows"][0]["normal_rect"] == [500, 500, 900, 900]
+
+
+# ---------------------------------------------------------------- 副モニタの作業領域のずれ
+# 主モニタはタスクバーが下(ずれ 0)、副モニタはタスクバーが左(48px)・上(40px)。
+# ワークスペース座標のずれはウィンドウが載っているモニタのもの(主モニタのずれを全モニタに使わない)。
+PRIMARY_BOTTOM = fake_monitor("\\\\.\\DISPLAY1", (0, 0, 1920, 1080), primary=True, work=(0, 0, 1920, 1040))
+SECOND_LEFT = fake_monitor("\\\\.\\DISPLAY2", (1920, 0, 3840, 1080), work=(1968, 0, 3840, 1080))
+SECOND_TOP = fake_monitor("\\\\.\\DISPLAY2", (1920, 0, 3840, 1080), work=(1920, 40, 3840, 1080))
+TWO_LEFT = [PRIMARY_BOTTOM, SECOND_LEFT]
+TWO_TOP = [PRIMARY_BOTTOM, SECOND_TOP]
+
+
+def test_workspace_conversion_uses_the_windows_own_monitor() -> None:
+    assert monitors.workspace_to_screen((1952, 100, 2552, 700), TWO_LEFT) == (2000, 100, 2600, 700)
+    assert monitors.screen_to_workspace((2000, 100, 2600, 700), TWO_LEFT) == (1952, 100, 2552, 700)
+    assert monitors.workspace_to_screen((2000, 60, 2600, 660), TWO_TOP) == (2000, 100, 2600, 700)
+    assert monitors.screen_to_workspace((2000, 100, 2600, 700), TWO_TOP) == (2000, 60, 2600, 660)
+    # 主モニタ上のウィンドウは主モニタのずれ(ここでは 0)
+    assert monitors.workspace_to_screen((100, 100, 500, 500), TWO_LEFT) == (100, 100, 500, 500)
+
+
+def test_plain_window_on_offset_secondary_is_not_snapped() -> None:
+    # 旧実装は主モニタのずれ (0, 0) で比べたため、ここを「スナップ中」と誤判定して 48px ずれた矩形を保存していた
+    w = _win(1, (1952, 100, 2552, 700), (2000, 100, 2600, 700))
+    assert effective_normal_rect(w, TWO_LEFT) == ((1952, 100, 2552, 700), False)
+    w = _win(2, (2000, 60, 2600, 660), (2000, 100, 2600, 700))
+    assert effective_normal_rect(w, TWO_TOP) == ((2000, 60, 2600, 660), False)
+
+
+def test_snapped_window_on_offset_secondary_converts_with_its_monitor() -> None:
+    # 副モニタの左半分にスナップ(見た目は作業領域の左半分)
+    w = _win(1, (1952, 100, 2552, 700), (1968, 0, 2904, 1080))
+    assert effective_normal_rect(w, TWO_LEFT) == ((1920, 0, 2856, 1080), True)
+    assert monitors.workspace_to_screen((1920, 0, 2856, 1080), TWO_LEFT) == (1968, 0, 2904, 1080)
+
+
+def test_save_and_plan_on_offset_secondary(tmp_path: Path) -> None:
+    win = _win(21, (1952, 100, 2552, 700), (2000, 100, 2600, 700))
+    api = FakeWin32(monitors=TWO_LEFT, windows=[win], pid=4242)
+    ctx, mod = make_module(tmp_path, api, {"targets": [{"exe": "ed.exe"}]})
+    mod.start()
+    assert mod.save("tray")
+    sig = mod.last_sig.signature
+    lay = mod.store.load_layout(sig)
+    assert lay is not None and lay.windows[0].normal_rect == (1952, 100, 2552, 700) and not lay.windows[0].snapped
+    plan, _ = mod.plan_for(sig)
+    assert plan is not None and [i.key for i in plan.items] == ["unchanged"]
+
+
+def test_offscreen_check_uses_per_monitor_offset() -> None:
+    from deskkit.modules.layoutkeep.planner import _on_screen
+
+    assert _on_screen((1952, 100, 2552, 700), TWO_LEFT)
+    assert not _on_screen((5000, 100, 5600, 700), TWO_LEFT)

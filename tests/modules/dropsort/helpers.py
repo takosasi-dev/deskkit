@@ -100,6 +100,10 @@ class FakeCtx:
         self.hotkeys = FakeHotkeys()
         self.quick: list[tuple[str, Callable[..., Any], str]] = []
         self.page_shown = 0
+        self.handlers: dict[str, list[Callable[[Any], None]]] = {}
+        self.emitted: list[tuple[str, dict[str, Any]]] = []
+        self.snoozed = False
+        self.modes: list[tuple[str, str]] = []
 
     def settings(self) -> Any:
         return MappingProxyType(copy.deepcopy(self._section))
@@ -174,6 +178,24 @@ class FakeCtx:
 
     def dpi_awareness(self) -> str:
         return "per_monitor_aware_v2"
+
+    # ---- v0.2 の ctx API(契約 §1・§2)
+    def is_snoozed(self) -> bool:
+        return self.snoozed
+
+    def list_modes(self) -> list[tuple[str, str]]:
+        return list(self.modes)
+
+    def on(self, event: str, handler: Callable[[Any], None]) -> None:
+        self.handlers.setdefault(event, []).append(self.safe(handler, f"event:{event}"))
+
+    def emit(self, event: str, payload: dict[str, Any]) -> None:
+        self.emitted.append((event, dict(payload)))
+
+    def fire(self, event: str, payload: dict[str, Any]) -> None:
+        """テスト用: 他モジュール・本体からイベントが届いたことにする。"""
+        for h in list(self.handlers.get(event, [])):
+            h(dict(payload))
 
 
 def wait_worker(module: Any, ctx: FakeCtx) -> None:

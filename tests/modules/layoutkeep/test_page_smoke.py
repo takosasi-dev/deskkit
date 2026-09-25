@@ -100,3 +100,58 @@ def test_monitor_map_standalone(qapp: object) -> None:
     m.set_data([], [])
     m.grab()
     m.close()
+
+
+def test_page_presets_snapshot_and_place_cards(qapp: object, tmp_path: Path, scenario: Scenario) -> None:
+    from deskkit.modules.layoutkeep.placer import PlaceEvent
+
+    ctx, mod = make_module(tmp_path, scenario.api, {"targets": [{"exe": t} for t in scenario.targets]})
+    sig = scenario.layout.signature
+    mod.store.save_layout(scenario.layout)
+    mod.store.save_layout(scenario.layout, "配信用")
+    mod.start()
+    assert mod.snapshot_now("cli") == "saved"
+    mod.place_events.appendleft(PlaceEvent("2026-09-25T10:00:00+09:00", "ed.exe", "EdWnd", 5, "would_move", "move", "M-3",
+                                           "基本", (0, 0, 10, 10), (100, 100, 700, 600)))
+    page = mod.create_page()
+    page.resize(1100, 900)
+    page.show()
+    _pump(qapp)
+    page.refresh()
+    _pump(qapp)
+    # プリセット2件 + 自動保存「最新」
+    assert page.tbl_presets.rowCount() == 3
+    assert page.tbl_layouts.item(0, 2).text().startswith("2 件")
+    assert page.tbl_place.rowCount() == 1 and "試運転" in page.tbl_place.item(0, 1).text()
+    assert "最新" in page.lbl_snap.text()
+    # 「配信用」を選ぶ → マップ・表はそのプリセット。計画は試運転で動かさない
+    page.tbl_presets.selectRow(1)
+    _pump(qapp)
+    assert page._shown_preset == "配信用"
+    assert page.btn_p_default.isEnabled() and page.btn_p_apply.isEnabled()
+    page._preset_plan()
+    _pump(qapp)
+    assert mod.last_plan_preset == "配信用" and "配信用" in page.lbl_plan.text()
+    assert scenario.api.set_calls == []
+    # 既定にする
+    page._preset_default()
+    _pump(qapp)
+    assert mod.preset_names(sig)[0] == "配信用"
+    # 自動保存の行を選ぶと上書き・名前変更・削除はできない
+    page.tbl_presets.selectRow(2)
+    _pump(qapp)
+    assert page._shown_preset == "自動"
+    assert not page.btn_p_overwrite.isEnabled() and not page.btn_p_delete.isEnabled() and page.btn_p_plan.isEnabled()
+    # L2 / L3 のスイッチ
+    page._on_place_toggle(True)
+    assert ctx.section["place_new"]["enabled"] is True and mod._place_timer is not None
+    page._set_nested("auto_snapshot", "enabled", False)
+    assert ctx.section["auto_snapshot"]["enabled"] is False
+    page._snap_now()
+    ctx.snoozed = True
+    page.refresh()
+    _pump(qapp)
+    assert not page.pill_snooze.isHidden()
+    page.close()
+    page.deleteLater()
+    _pump(qapp)

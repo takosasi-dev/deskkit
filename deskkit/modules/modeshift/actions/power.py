@@ -93,6 +93,16 @@ class PowercfgPower:
             return False, f"読み戻した GUID が違う({back})"
         return True, "読み戻して一致を確認"
 
+    def ac_online(self) -> bool | None:
+        """GetSystemPowerStatus の ACLineStatus(電源のきっかけ用。読むだけ)。"""
+        return ac_online()
+
+
+def ac_online() -> bool | None:
+    from deskkit.modules.modeshift._win32 import ac_line_status
+
+    return ac_line_status()
+
 
 def plan(a: dict[str, Any], env: PlanEnv) -> Step:
     guid: str = a["guid"]

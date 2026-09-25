@@ -75,6 +75,25 @@ class _Invoker(QObject):
         fn()  # type: ignore[operator]  # fn は safe 済み
 
 
+def list_modes(section: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """modeshift セクションの modes[*] から (name, label)。name が空・文字列でない要素は飛ばし、label が無ければ name。"""
+    modes = section.get("modes")
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    if not isinstance(modes, list):
+        return out
+    for m in modes:
+        if not isinstance(m, dict):
+            continue
+        name = m.get("name")
+        if not isinstance(name, str) or not name.strip() or name in seen:
+            continue
+        label = m.get("label")
+        seen.add(name)
+        out.append((name, label if isinstance(label, str) and label.strip() else name))
+    return out
+
+
 class ModuleContextImpl:
     def __init__(self, host: Host, name: str) -> None:
         self._host = host
@@ -84,6 +103,7 @@ class ModuleContextImpl:
         self.hotkeys = ModuleHotkeys(host.hotkeys, self)
         self._timers: list[QTimer] = []
         self._errors: dict[str, int] = {}
+        self.error_totals: dict[str, int] = {}  # 起動からの例外の累計(診断レポート用。連続回数の _errors とは別)
         self._alive = True
         self._invoker = _Invoker()
         self._lock = threading.Lock()
@@ -117,6 +137,7 @@ class ModuleContextImpl:
             except Exception as e:  # noqa: BLE001 - モジュールの例外を host へ漏らさない
                 n = self._errors.get(key, 0) + 1
                 self._errors[key] = n
+                self.error_totals[key] = self.error_totals.get(key, 0) + 1
                 self.log.exception("ハンドラ %s で例外(連続 %d 回目)", key, n)
                 limit = int(self._host.settings.host().get("handler_error_limit", 5))
                 if n >= limit:
@@ -145,6 +166,15 @@ class ModuleContextImpl:
 
     def game_processes(self) -> frozenset[str]:
         return self._host.settings.game_processes()
+
+    def list_modes(self) -> list[tuple[str, str]]:
+        """ModeShift の設定にあるモードの (name, label) 一覧(ModeShift が無効でも返す。壊れた要素は飛ばす)。"""
+        return list_modes(self._host.settings.module_section("modeshift"))
+
+    # ---- 一時停止(H2)
+    def is_snoozed(self) -> bool:
+        """一時停止中なら True。自動で動く処理の入口で見る(手で押した操作は止めない)。どのスレッドからでも呼べる。"""
+        return self._host.snooze.is_snoozed()
 
     # ---- トレイ
     def add_tray_action(self, label: str, callback: Callable[[], None], *, checkable: bool = False,
@@ -175,7 +205,7 @@ class ModuleContextImpl:
     def notify(self, title: str, text: str, on_click: Callable[[], None] | None = None, *,
                level: str = "info") -> None:
         cb = self.safe(on_click, "notify:on_click") if on_click is not None else None
-        self._host.notify(self.name, title, text, cb, level=level)
+        self._host.notify(self.name, title, text, cb, level=level, alive=lambda: self._alive)
 
     # ---- システムメッセージ
     def on_native(self, msg: int, handler: Callable[[int, int], None]) -> None:

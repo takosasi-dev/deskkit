@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable
 
 from deskkit.modules.modeshift import undo
-from deskkit.modules.modeshift.actions import audio, close, launch, layout, power
+from deskkit.modules.modeshift.actions import audio, close, launch, layout, power, theme
 from deskkit.modules.modeshift.actions import open as opn
 from deskkit.modules.modeshift.actions.common import ExecEnv
 from deskkit.modules.modeshift.model import ABORTED, FAILED, OK, SKIPPED, UNDOABLE_TYPES, Plan, Step
@@ -25,11 +25,15 @@ RUNNERS: dict[str, Runner] = {
     "open_path": opn.run_path,
     "open_url": opn.run_url,
     "layout_apply": layout.run,
+    "mic_volume": audio.run_mic,
+    "theme": theme.run,
 }
 UNDO_RUNNERS: dict[str, Runner] = {
     "power_plan": undo.run_power,
     "master_volume": undo.run_master,
     "app_volume": undo.run_app,
+    "mic_volume": undo.run_mic,
+    "theme": undo.run_theme,
 }
 
 

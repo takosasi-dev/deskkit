@@ -49,9 +49,14 @@ def palette() -> list[tuple[str, str]]:
     return [(k, palette_color(k)) for k in PALETTE_KEYS]
 
 
+# host の theme.G に無い字形(Segoe Fluent Icons / MDL2 Assets のコードポイント)
+GLYPH_MIC = "\uE720"      # Microphone
+GLYPH_THEME = "\uE706"    # Brightness
+
 TYPE_GLYPHS: dict[str, str] = {
     "launch_app": G.APP, "close_app": G.CLOSE, "power_plan": G.POWER, "master_volume": G.VOLUME,
     "app_volume": G.VOLUME, "open_path": G.FOLDER, "open_url": G.LINK, "layout_apply": G.LAYOUT,
+    "mic_volume": GLYPH_MIC, "theme": GLYPH_THEME,
 }
 
 

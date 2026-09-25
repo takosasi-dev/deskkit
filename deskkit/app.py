@@ -64,6 +64,7 @@ def main(argv: list[str]) -> int:
         print(__version__)
         return 0
     notice: str | None = None
+    post_update = False
     if len(argv) >= 2 and argv[0] == "--post-update":
         # 更新・巻き戻しの直後: 旧プロセスの終了を待ってから通常どおり起動する
         from deskkit import updater
@@ -72,6 +73,7 @@ def main(argv: list[str]) -> int:
             updater.wait_for_pid_exit(int(argv[1]))
         except ValueError:
             pass
+        post_update = True
         rest = argv[2:]
         if len(rest) >= 2 and rest[0] == "--updated-from":
             notice = f"v{rest[1]} から v{__version__} に更新しました"
@@ -107,12 +109,42 @@ def main(argv: list[str]) -> int:
             print(out)
         return code
     if not ipc.acquire_instance_mutex():
-        from PySide6.QtCore import QCoreApplication
+        if post_update:
+            # 更新・再起動の直後: 旧プロセスの終了処理(大きなファイルの移動の完了待ちなど)が長引いても、
+            # 終わるまで待ってから常駐を引き継ぐ。終わりかけの旧プロセスへ --show を送ると両方いなくなるので送らない
+            if not ipc.wait_instance_mutex(POST_UPDATE_MUTEX_WAIT_S):
+                logging.getLogger("deskkit.host").error("旧プロセスが終了しないため起動を中止しました")
+                return 1
+        else:
+            return _forward_to_running(argv)
+    return _run_resident(argv, dpi, notice)
 
-        _app = QCoreApplication(sys.argv[:1])
-        code, _out = ipc.forward(["--show"] if not argv or argv[0] != "--autostart" else ["--autostart"], 5000)
-        return 0 if code in (0, ipc.EXIT_NOT_RUNNING) else code
 
+POST_UPDATE_MUTEX_WAIT_S = 180.0
+
+
+def _forward_to_running(argv: list[str]) -> int:
+    """既に常駐している DeskKit に画面を開かせる(二重起動しない)。"""
+    from PySide6.QtCore import QCoreApplication
+
+    from deskkit import ipc
+
+    _app = QCoreApplication(sys.argv[:1])
+    code, _out = ipc.forward(["--show"] if not argv or argv[0] != "--autostart" else ["--autostart"], 5000)
+    return 0 if code in (0, ipc.EXIT_NOT_RUNNING) else code
+
+
+def after_update_housekeeping() -> None:
+    """更新・巻き戻し後の起動に成功したら、ダウンロード済みの更新ファイルを消す(巻き戻しは DeskKit.previous.exe を使うので不要)。"""
+    from deskkit import updater
+
+    try:
+        updater.cleanup_downloads(paths.local_dir() / "updates")
+    except OSError:
+        logging.getLogger("deskkit.host").warning("更新ファイルを片付けられませんでした")
+
+
+def _run_resident(argv: list[str], dpi: str, notice: str | None) -> int:
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtWidgets import QApplication
@@ -129,9 +161,10 @@ def main(argv: list[str]) -> int:
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
-    from deskkit.ui import icons, theme
+    from deskkit.ui import icons, theme, wheel_guard
 
     theme.apply(app)
+    wheel_guard.install(app)  # フォーカスの無い数値欄・選択欄はホイールでページをスクロールする(UX-1)
     app.setWindowIcon(icons.app_icon())
     sys.excepthook = _excepthook
     from deskkit.host import Host
@@ -141,6 +174,7 @@ def main(argv: list[str]) -> int:
     autostarted = bool(argv) and argv[0] == "--autostart"
     if notice:
         host.notify("host", notice, "", host.show_window, level="ok")
+        after_update_housekeeping()
     if created or (not autostarted and host.settings.host().get("show_window_on_start", True)):
         host.show_window()
     if not host.settings.host().get("onboarded", False) and not autostarted:

@@ -7,7 +7,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import PureWindowsPath
 
 from deskkit.modules.clipshelf import policy
@@ -119,7 +119,10 @@ class ClipMonitor:
             if latest is not None and latest.text == text:
                 st.touch(latest.id)  # 直前と同じなら新規行を作らない(FR-6)
                 return self._finish(policy.DUPLICATE, owner, names, latest.id)
-            item = st.add_history(text, owner)
+            # C3: 短命記録の対象アプリ(exe 名だけで判定。内容は見ない)なら期限を payload に入れる
+            expires = (self._now() + timedelta(minutes=cfg.short_lived_minutes)
+                       if owner is not None and owner in cfg.short_lived_exes else None)
+            item = st.add_history(text, owner, expires)
         except CryptoError as e:
             self._log.error("encrypt failed (not recorded): win32 error %d", e.code)
             return self._finish_unrecorded(owner, names)

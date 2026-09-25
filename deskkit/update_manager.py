@@ -155,23 +155,29 @@ class UpdateManager(QObject):
             exe = updater.swap_in(path)
             log.info("update swapped in, relaunching")
             updater.relaunch(exe, ["--updated-from", __version__])
-        except updater.UpdateError as e:
-            self.state = "error"
-            self.error = str(e)
-            self.changed.emit()
+        except Exception as e:  # noqa: BLE001 - どの失敗でも「入れ替え中」のまま固まらせない
+            self._fail(e, "更新に失敗しました")
             return
         QTimer.singleShot(200, self._host.quit)
 
     def rollback(self) -> None:
+        if self.state in ("downloading", "installing"):
+            return
+        self.state = "installing"
+        self.changed.emit()
         try:
             exe = updater.swap_back()
             updater.relaunch(exe, ["--rolled-back-from", __version__])
-        except updater.UpdateError as e:
-            self.state = "error"
-            self.error = str(e)
-            self.changed.emit()
+        except Exception as e:  # noqa: BLE001
+            self._fail(e, "前の版に戻せませんでした")
             return
         QTimer.singleShot(200, self._host.quit)
+
+    def _fail(self, e: BaseException, fallback: str) -> None:
+        log.error("update swap failed: %s", type(e).__name__)  # 例外の本文(パスを含みうる)はログに書かない
+        self.state = "error"
+        self.error = str(e) if isinstance(e, updater.UpdateError) else f"{fallback}({type(e).__name__})"
+        self.changed.emit()
 
     def has_previous(self) -> bool:
         return updater.previous_exe() is not None

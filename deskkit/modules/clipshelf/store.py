@@ -43,6 +43,7 @@ class Item:
     text: str
     source_exe: str | None
     name: str | None
+    expires_at: datetime | None = None  # 短命記録(アプリ別)の期限。payload の中だけに持つ(平文列を足さない)
     norm: str = field(default="", repr=False)  # search.py が使う正規化済みの文字列(メモリのみ)
 
     def __repr__(self) -> str:  # 本文を repr に出さない(例外・ログに混ざるのを防ぐ)
@@ -69,6 +70,7 @@ class Store:
         self._now = now
         self._conn: sqlite3.Connection | None = None
         self._items: dict[int, Item] = {}
+        self._undecryptable_kinds: dict[int, str] = {}  # 復号できない行の id → kind(平文列だけから分かる)
         self.undecryptable = 0
         self.load_ms = 0.0
 
@@ -110,14 +112,17 @@ class Store:
     def _load(self) -> None:
         t0 = time.perf_counter()
         self._items.clear()
+        self._undecryptable_kinds.clear()
         self.undecryptable = 0
         rows = self._db().execute("SELECT id, kind, created_at, last_used_at, pinned, payload FROM items").fetchall()
         for rid, kind, created, used, pinned, blob in rows:
             try:
                 p = decode_payload(self._cipher, bytes(blob))
-                item = Item(int(rid), str(kind), from_iso(created), from_iso(used), bool(pinned), p.text, p.source_exe, p.name)
+                item = Item(int(rid), str(kind), from_iso(created), from_iso(used), bool(pinned), p.text, p.source_exe, p.name,
+                            expires_at=p.expires_at)
             except (CryptoError, ValueError):
-                self.undecryptable += 1  # 表示しない・自動削除しない(§10)
+                self.undecryptable += 1  # 表示しない・自動削除しない(§10。消すのは利用者の全消去だけ)
+                self._undecryptable_kinds[int(rid)] = str(kind)
                 continue
             self._items[item.id] = item
         self.load_ms = (time.perf_counter() - t0) * 1000.0
@@ -148,10 +153,28 @@ class Store:
             "undecryptable": self.undecryptable,
         }
 
+    def undecryptable_counts(self) -> dict[str, int]:
+        """復号できない行の件数を kind 別に(履歴は全消去で消える。定型文は消さない)。"""
+        hist = sum(1 for k in self._undecryptable_kinds.values() if k == KIND_HISTORY)
+        return {"history": hist, "snippets": len(self._undecryptable_kinds) - hist}
+
     def history_created_dates(self) -> list[date]:
-        """履歴の作成日(平文の created_at 列だけを読む。payload は復号しない)。"""
+        """履歴の作成日(平文の created_at 列だけを読む。payload は復号しない)。
+
+        利用状況の集計スレッドから呼ばれるので、GUI スレッドの接続を使わず、読み取り専用の接続をその場で開いて閉じる。
+        """
+        self._db()  # 閉じていれば StoreError
         out: list[date] = []
-        for (created,) in self._db().execute("SELECT created_at FROM items WHERE kind = 'history'"):
+        try:
+            conn = sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True)
+            try:
+                conn.execute("PRAGMA temp_store = MEMORY")
+                rows = conn.execute("SELECT created_at FROM items WHERE kind = 'history'").fetchall()
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError as e:
+            raise StoreError(f"DB を読めません({type(e).__name__})") from None
+        for (created,) in rows:
             try:
                 out.append(from_iso(str(created)).date())
             except ValueError:
@@ -162,8 +185,10 @@ class Store:
         return int(self._db().execute("SELECT COUNT(*) FROM items").fetchone()[0])
 
     # ------------------------------------------------------------ 書き込み
-    def _insert(self, kind: str, text: str, source_exe: str | None, name: str | None) -> Item:
-        blob = encode_payload(self._cipher, Payload(text, source_exe, name))  # 失敗時は CryptoError(平文で保存しない)
+    def _insert(self, kind: str, text: str, source_exe: str | None, name: str | None,
+                expires_at: datetime | None = None) -> Item:
+        # 失敗時は CryptoError(平文で保存しない)
+        blob = encode_payload(self._cipher, Payload(text, source_exe, name, expires_at))
         now = self._now()
         iso = to_iso(now)
         try:
@@ -173,12 +198,12 @@ class Store:
             )
         except sqlite3.DatabaseError as e:
             raise StoreError(f"DB に書けません({type(e).__name__})") from None
-        item = Item(int(cur.lastrowid or 0), kind, now, now, False, text, source_exe, name)
+        item = Item(int(cur.lastrowid or 0), kind, now, now, False, text, source_exe, name, expires_at=expires_at)
         self._items[item.id] = item
         return item
 
-    def add_history(self, text: str, source_exe: str | None) -> Item:
-        return self._insert(KIND_HISTORY, text, source_exe, None)
+    def add_history(self, text: str, source_exe: str | None, expires_at: datetime | None = None) -> Item:
+        return self._insert(KIND_HISTORY, text, source_exe, None, expires_at)
 
     def add_snippet(self, name: str, text: str) -> Item:
         return self._insert(KIND_SNIPPET, text, None, name)
@@ -243,8 +268,7 @@ class Store:
         return len(ids)
 
     # ------------------------------------------------------------ 保持上限・全消去
-    def trim(self, max_items: int, max_days: int) -> int:
-        """ピン以外の履歴を、max_items 件・max_days 日を超えた分だけ古い順に削除する(0 は無制限)。"""
+    def _trim_ids(self, max_items: int, max_days: int) -> list[int]:
         cands = sorted((i for i in self._items.values() if i.kind == KIND_HISTORY and not i.pinned),
                        key=lambda i: (i.last_used_at, i.id), reverse=True)
         doomed: set[int] = set()
@@ -253,15 +277,51 @@ class Store:
         if max_days > 0:
             limit = self._now() - timedelta(days=max_days)
             doomed.update(i.id for i in cands if i.last_used_at < limit)
-        return self._delete_ids(sorted(doomed))
+        return sorted(doomed)
+
+    def trim_preview(self, max_items: int, max_days: int) -> int:
+        """その上限で trim したら何件消えるか(消さない。設定画面の確認用)。"""
+        return len(self._trim_ids(max_items, max_days))
+
+    def trim(self, max_items: int, max_days: int) -> int:
+        """ピン以外の履歴を、max_items 件・max_days 日を超えた分だけ古い順に削除する(0 は無制限)。"""
+        return self._delete_ids(self._trim_ids(max_items, max_days))
+
+    def expire(self) -> int:
+        """期限(expires_at)を過ぎた履歴を削除する。ピンは対象外(利用者が明示的に残したもの)。"""
+        now = self._now()
+        return self._delete_ids(sorted(
+            i.id for i in self._items.values()
+            if i.kind == KIND_HISTORY and not i.pinned and i.expires_at is not None and i.expires_at <= now
+        ))
+
+    def short_lived_count(self) -> int:
+        return sum(1 for i in self._items.values() if i.kind == KIND_HISTORY and i.expires_at is not None)
 
     def clear_all(self, include_pins: bool) -> int:
-        """kind=history を削除(ピンは include_pins のときだけ)。定型文は消さない。その後 VACUUM とキャッシュ破棄。"""
-        ids = [i.id for i in self._items.values() if i.kind == KIND_HISTORY and (include_pins or not i.pinned)]
-        n = self._delete_ids(ids)
+        """kind=history を削除(ピンは include_pins のときだけ)。定型文は消さない。その後 VACUUM とキャッシュ破棄。
+        メモリに読めた行だけでなく DB の行を SQL で直接消す。復号できない履歴の行は、表示も利用もできず残すと警告が
+        出続けるだけなので、ピンの列に関係なく消す(復号できない定型文は「定型文は消さない」のとおり残す)。"""
+        db = self._db()
+        bad_ids = sorted(i for i, k in self._undecryptable_kinds.items() if k == KIND_HISTORY)
         try:
-            self._db().execute("VACUUM")
+            db.execute("BEGIN")
+            cur = db.execute("DELETE FROM items WHERE kind = 'history' AND (pinned = 0 OR ?)", (1 if include_pins else 0,))
+            n = max(0, cur.rowcount)
+            for i in range(0, len(bad_ids), 500):
+                chunk = bad_ids[i:i + 500]
+                cur = db.execute(f"DELETE FROM items WHERE kind = 'history' AND id IN ({','.join('?' * len(chunk))})", chunk)
+                n += max(0, cur.rowcount)
+            db.execute("COMMIT")
+        except sqlite3.DatabaseError as e:
+            try:
+                db.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise StoreError(f"DB から削除できません({type(e).__name__})") from None
+        try:
+            db.execute("VACUUM")
         except sqlite3.DatabaseError as e:
             raise StoreError(f"VACUUM に失敗しました({type(e).__name__})") from None
-        self._load()  # メモリキャッシュを捨てて読み直す(残るのはピンと定型文)
+        self._load()  # メモリキャッシュを捨てて読み直す(残るのはピンと定型文。復号できない件数も数え直す)
         return n
