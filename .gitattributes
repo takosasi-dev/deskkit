@@ -1,0 +1,5 @@
+* text=auto eol=lf
+# Windows PowerShell 5.1 で読むので CRLF(UTF-8 BOM 付き)
+*.ps1 text eol=crlf
+*.ico binary
+*.png binary

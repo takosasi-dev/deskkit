@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ビルド成果物(exe は GitHub Releases で配布する)
+build/
+dist/
+*.exe
+*.exe.sha256
+
+# エディタ・OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
