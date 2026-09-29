@@ -8,16 +8,25 @@ import os
 import tempfile
 import time
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from deskkit.fileops import RecycleResult
 from deskkit.modules.pccheckup import cleanup
-from deskkit.modules.pccheckup.checks import net, perf, storage
+from deskkit.modules.pccheckup.checks import boot, net, perf, storage
 from deskkit.modules.pccheckup.checks.base import Cancel, GiB
-from deskkit.modules.pccheckup.fakes import FakeProbes
+from deskkit.modules.pccheckup.fakes import FakeProbes, sb_raw
 from deskkit.modules.pccheckup.history import History
-from deskkit.modules.pccheckup.probes import CpuSample, DiskInfo, MemInfo, ProcUsage, SizeInfo, StartupInfo
+from deskkit.modules.pccheckup.probes import (
+    CpuSample,
+    DiskInfo,
+    MemInfo,
+    ProcUsage,
+    RegRead,
+    SecureBootRaw,
+    SizeInfo,
+    StartupInfo,
+)
 from deskkit.modules.pccheckup.report import Secrets, build, redact
 from deskkit.modules.pccheckup.runner import ALL_IDS, run_category
 
@@ -48,6 +57,41 @@ def _thresholds(r: _Result) -> None:
             [perf.judge_startup(StartupInfo(n, 0)).status for n in (25, 15, 14)] == ["bad", "warn", "good"])
     r.check("S2 1GB ちょうどは info", storage.judge_recycle_bin(GiB).status == "info"
             and storage.judge_recycle_bin(GiB - 1).status == "good")
+
+
+def _boot(r: _Result) -> None:
+    print("起動の安全 B1・B2 の判定表(追加仕様書 §6.2)")
+    ok0, ok1, miss, deny = RegRead("ok", 0), RegRead("ok", 1), RegRead("missing"), RegRead("denied")
+
+    def reasons(raw: SecureBootRaw) -> tuple[str, str]:
+        return boot.reasons(raw, date(2026, 10, 18))
+
+    r.check("B1 BIOS は legacy_bios・有効は sb_on・0 は sb_off",
+            [reasons(sb_raw("bios"))[0], reasons(sb_raw(sb=ok1))[0], reasons(sb_raw(sb=ok0))[0]]
+            == ["legacy_bios", "sb_on", "sb_off"])
+    r.check("B1 権限なしは sb_denied・無い値は sb_unknown",
+            [reasons(sb_raw(sb=deny))[0], reasons(sb_raw(sb=miss))[0]] == ["sb_denied", "sb_unknown"])
+    rows = [
+        (sb_raw("bios"), "cert_skipped_bios"),
+        (sb_raw(error=deny), "cert_denied"),
+        (sb_raw(status=miss, error=miss, capable=miss), "cert_missing"),
+        (sb_raw(error=RegRead("ok", 5)), "cert_conflict"),
+        (sb_raw(), "cert_updated"),
+        (sb_raw(sb=ok0, status=RegRead("ok", "NotStarted")), "cert_sb_off"),
+        (sb_raw(status=RegRead("ok", "NotStarted"), error=RegRead("ok", 5)), "cert_error"),
+        (sb_raw(status=RegRead("ok", "InProgress")), "cert_in_progress"),
+        (sb_raw(status=RegRead("ok", " notstarted ")), "cert_not_started"),
+        (sb_raw(status=miss, capable=RegRead("ok", 2)), "cert_boot_2023"),
+        (sb_raw(status=RegRead("ok", "Paused")), "cert_unexpected"),
+    ]
+    r.check("B2 の表の 11 行", [reasons(raw)[1] for raw, _ in rows] == [want for _, want in rows])
+    statuses = [boot.judge_b2(raw, boot.judge_b1(raw)[1], d)[0].status
+                for raw, _ in rows for d in (date(2026, 10, 18), date(2026, 10, 19))]
+    r.check("B1・B2 は bad を出さない(B-4)", "bad" not in statuses)
+    ns = sb_raw(status=RegRead("ok", "NotStarted"))
+    before = boot.judge_b2(ns, "sb_on", date(2026, 10, 18))[0].detail
+    after = boot.judge_b2(ns, "sb_on", date(2026, 10, 19))[0].detail
+    r.check("10/18 は期限前・10/19 は期限後の文", before == boot.NOT_STARTED_BEFORE and after == boot.NOT_STARTED_AFTER)
 
 
 def _runner(r: _Result) -> None:
@@ -132,6 +176,7 @@ def run() -> int:
     print("PcCheckup 自己検査")
     r = _Result()
     _thresholds(r)
+    _boot(r)
     _runner(r)
     _report(r)
     with tempfile.TemporaryDirectory(prefix="pccheckup-selftest-") as d:

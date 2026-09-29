@@ -372,17 +372,18 @@ def test_theme_has_colors_for_all_modules() -> None:
     for n in catalog.MODULE_NAMES:
         assert n in theme._LIGHT_MODULE_ACCENTS, n
         assert n in theme._CHART_DARK, n
-    assert len(set(theme._LIGHT_MODULE_ACCENTS.values())) == 7
-    assert len(set(theme._CHART_DARK.values())) == 7
-    assert len({m.accent for m in catalog.MODULES}) == 7
+    assert len(set(theme._LIGHT_MODULE_ACCENTS.values())) == len(catalog.MODULE_NAMES)
+    assert len(set(theme._CHART_DARK.values())) == len(catalog.MODULE_NAMES)
+    assert len({m.accent for m in catalog.MODULES}) == len(catalog.MODULE_NAMES)
 
 
-def test_version_is_030() -> None:
+def test_version_is_040() -> None:  # v0.4.0 で版を上げた(H4-12)
     import deskkit
 
-    assert deskkit.__version__ == "0.3.0"
-    assert 'version = "0.3.0"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert "## [0.3.0] - 2026-09-25" in (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert deskkit.__version__ == "0.4.0"
+    assert 'version = "0.4.0"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "## [0.4.0] - " in changelog and "## [0.3.0] - 2026-09-25" in changelog
 
 
 # ---------------------------------------------------------------- 例外のログに本文・パスを書かない(v0.3 VINV-4)

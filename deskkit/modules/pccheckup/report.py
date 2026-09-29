@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -51,12 +51,13 @@ def redact(text: str, s: Secrets) -> str:
     return out
 
 
-def _finding_lines(f: Finding, worse: bool) -> list[str]:
+def _finding_lines(f: Finding, worse: bool, suffix: str = "") -> list[str]:
     head = f"[{STATUS_TEXT[f.status]}] {f.title}"
     if f.value:
         head += f": {f.value}"
     if worse:
         head += "(前回より悪化)"
+    head += suffix  # B1・B2 の読んだ生の値(SB-FR-5)。コピーにだけ出す
     lines = [head]
     if f.detail:
         lines.append(f"  {f.detail}")
@@ -73,14 +74,15 @@ def _finding_lines(f: Finding, worse: bool) -> list[str]:
 
 
 def build(sections: Sequence[tuple[str, Sequence[Finding], int | None]], when: datetime, secrets: Secrets,
-          worse: Iterable[str] = ()) -> str:
-    """sections: (カテゴリ, 結果, 所要ミリ秒 or None)。status の悪い順に並べる。"""
+          worse: Iterable[str] = (), suffixes: Mapping[str, str] | None = None) -> str:
+    """sections: (カテゴリ, 結果, 所要ミリ秒 or None)。status の悪い順に並べる。suffixes はチェック ID ごとに見出しの行の末尾に付ける文字列。"""
     worse_set = set(worse)
+    sfx = suffixes or {}
     out = [f"PcCheckup の診断結果({when.strftime('%Y-%m-%d %H:%M')})"]
     for cat, findings, ms in sections:
         out.append("")
         took = f"(所要 {ms / 1000:.1f} 秒)" if ms is not None else ""
         out.append(f"■ {CATEGORY_TITLES.get(cat, cat)}{took}")
         for f in sorted(findings, key=lambda x: (STATUS_ORDER[x.status], x.check_id)):
-            out.extend(_finding_lines(f, f.check_id in worse_set))
+            out.extend(_finding_lines(f, f.check_id in worse_set, sfx.get(f.check_id, "")))
     return redact("\n".join(out) + "\n", secrets)

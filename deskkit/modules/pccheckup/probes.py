@@ -9,14 +9,15 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from deskkit.modules.pccheckup import cleanup, fswalk
 from deskkit.modules.pccheckup._win32 import AdapterInfo
 from deskkit.modules.pccheckup.checks.base import Cancel
 
 __all__ = ["AdapterInfo", "ConnInfo", "CpuSample", "DiskInfo", "FolderSize", "MemInfo", "PowerInfo", "ProcUsage",
-           "Probes", "ProxyInfo", "RealProbes", "SizeInfo", "StartupInfo"]
+           "Probes", "ProxyInfo", "RealProbes", "RegRead", "SecureBootRaw", "SizeInfo", "StartupInfo", "read_reg",
+           "read_secure_boot"]
 
 # 電源モード(オーバーレイ)の GUID。「最適な電力効率」だけを注意にする(P6)
 OVERLAY_BEST_EFFICIENCY = "961cc777-2547-4f9d-8174-7d86181b8a7a"
@@ -40,6 +41,12 @@ _APPROVED = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved
 _REBOOT_REQUIRED = r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
 _INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 _STORAGE_POLICY = r"Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy"
+# 起動の安全(B1・B2)。HKLM の下を KEY_READ で読むだけ(SB-INV-1)
+SB_STATE = r"SYSTEM\CurrentControlSet\Control\SecureBoot\State"
+SB_SERVICING = r"SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing"
+REG_SZ = 1
+REG_DWORD = 4
+ERROR_ACCESS_DENIED = 5
 
 
 @dataclass(frozen=True)
@@ -117,6 +124,30 @@ class FolderSize:
     size: SizeInfo
 
 
+RegKind = Literal["ok", "missing", "denied", "bad_type"]
+Firmware = Literal["uefi", "bios", "unknown"]
+
+
+@dataclass(frozen=True)
+class RegRead:
+    """レジストリの値を1つ読んだ結果。ok / missing(キーか値が無い)/ denied(権限が無い)/ bad_type(型が違う)。
+    bad_type の value は、数か文字列ならそのまま持つ(コピーに出すため)。それ以外は None。"""
+
+    kind: RegKind
+    value: int | str | None = None
+
+
+@dataclass(frozen=True)
+class SecureBootRaw:
+    """B1・B2 だけが使う読み取り結果(追加仕様書 §2)。生の値は画面とコピーにだけ出す(SB-INV-6)。"""
+
+    firmware: Firmware
+    sb_enabled: RegRead      # State\UEFISecureBootEnabled(REG_DWORD)
+    status: RegRead          # Servicing\UEFICA2023Status(REG_SZ)
+    error: RegRead           # Servicing\UEFICA2023Error(REG_DWORD)
+    capable: RegRead         # Servicing\WindowsUEFICA2023Capable(REG_DWORD)
+
+
 class Probes(Protocol):
     # 重い(P)
     def cpu(self, seconds: int, cancel: Cancel) -> CpuSample: ...
@@ -137,6 +168,8 @@ class Probes(Protocol):
     def downloads(self, limit_s: float, cancel: Cancel) -> tuple[str, SizeInfo]: ...
     def user_folders(self, limit_s: float, cancel: Cancel) -> list[FolderSize]: ...
     def storage_sense(self) -> bool: ...
+    # 起動の安全(B)
+    def secure_boot(self) -> SecureBootRaw: ...
 
 
 def _stopper(limit_s: float, cancel: Cancel) -> Callable[[], bool]:
@@ -427,6 +460,57 @@ class RealProbes:
                 return int(winreg.QueryValueEx(k, "01")[0]) == 1
         except FileNotFoundError:
             return False  # 一度もオンにしていない PC には値が無い(既定はオフ)
+
+    # ---- 起動の安全
+    def secure_boot(self) -> SecureBootRaw:
+        return self._cached("sb", read_secure_boot)  # type: ignore[no-any-return]
+
+
+def _denied(e: OSError) -> bool:
+    return isinstance(e, PermissionError) or getattr(e, "winerror", None) == ERROR_ACCESS_DENIED
+
+
+def read_reg(path: str, name: str, want_type: int, api: Any = None) -> RegRead:
+    """HKLM\\path の name を KEY_READ で読む。権限が無ければ denied、キーか値が無ければ missing、型が違えば bad_type。
+    それ以外の OSError はそのまま出す(そのチェックだけ unknown にする。§10)。api はテスト用の winreg の偽物。"""
+    if api is None:
+        import winreg as api_mod
+
+        api = api_mod
+    try:
+        with api.OpenKey(api.HKEY_LOCAL_MACHINE, path, 0, api.KEY_READ) as k:
+            value, typ = api.QueryValueEx(k, name)
+    except FileNotFoundError:
+        return RegRead("missing")
+    except OSError as e:
+        if _denied(e):
+            return RegRead("denied")
+        raise
+    ok = (want_type == REG_DWORD and typ == REG_DWORD and isinstance(value, int)) or (
+        want_type == REG_SZ and typ == REG_SZ and isinstance(value, str))
+    if ok:
+        return RegRead("ok", value)
+    return RegRead("bad_type", value if isinstance(value, (int, str)) else None)
+
+
+def read_secure_boot(api: Any = None, firmware: Callable[[], str] | None = None) -> SecureBootRaw:
+    """レジストリの4値と GetFirmwareType を読む(B-2)。書かない・外部のプロセスを起動しない(SB-INV-1・SB-INV-2)。"""
+    if firmware is None:
+        from deskkit.modules.pccheckup import _win32
+
+        firmware = _win32.firmware_type
+    try:
+        fw = firmware()
+    except OSError:
+        fw = "unknown"  # 失敗は unknown(§10)
+    fw_lit: Firmware = "uefi" if fw == "uefi" else "bios" if fw == "bios" else "unknown"
+    return SecureBootRaw(
+        fw_lit,
+        read_reg(SB_STATE, "UEFISecureBootEnabled", REG_DWORD, api),
+        read_reg(SB_SERVICING, "UEFICA2023Status", REG_SZ, api),
+        read_reg(SB_SERVICING, "UEFICA2023Error", REG_DWORD, api),
+        read_reg(SB_SERVICING, "WindowsUEFICA2023Capable", REG_DWORD, api),
+    )
 
 
 def count_startup(sources: list[tuple[list[str], dict[str, bytes]]]) -> StartupInfo:

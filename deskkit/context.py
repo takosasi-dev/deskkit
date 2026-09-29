@@ -203,9 +203,11 @@ class ModuleContextImpl:
         self._host.module_status_changed(self.name)
 
     def notify(self, title: str, text: str, on_click: Callable[[], None] | None = None, *,
-               level: str = "info") -> None:
+               level: str = "info", replace_key: str | None = None) -> None:
+        """(v0.4)replace_key: 保留中(H1)に同じ鍵の通知があれば古い方を捨てる。鍵はモジュールの中で一意なら良い(host がモジュール名で分ける)。"""
         cb = self.safe(on_click, "notify:on_click") if on_click is not None else None
-        self._host.notify(self.name, title, text, cb, level=level, alive=lambda: self._alive)
+        key = str(replace_key) if replace_key else None
+        self._host.notify(self.name, title, text, cb, level=level, alive=lambda: self._alive, replace_key=key)
 
     # ---- システムメッセージ
     def on_native(self, msg: int, handler: Callable[[int, int], None]) -> None:
@@ -231,6 +233,11 @@ class ModuleContextImpl:
         """任意のスレッドから、メインスレッドで fn を実行する。"""
         if self._alive:
             self._invoker.call.emit(self.safe(fn, getattr(fn, "__qualname__", "call_soon")))
+
+    def post(self, fn: Callable[[], None]) -> None:
+        """host 内部用: safe で包み済みの fn を、任意のスレッドからメインスレッドへ運ぶ(止まった後は捨てる)。"""
+        if self._alive:
+            self._invoker.call.emit(fn)
 
     def start_timer(self, interval_ms: int, callback: Callable[[], None], *, single_shot: bool = False) -> QTimer:
         t = QTimer()

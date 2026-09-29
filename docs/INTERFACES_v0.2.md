@@ -41,8 +41,8 @@ def diagnostics(self) -> dict[str, str | int | bool]: ...
 
 | イベント | 送信 | payload | 受信 |
 |---|---|---|---|
-| `modeshift.switched`(既存) | ModeShift | `{"mode": str, "run_id": str, "failed": int}` | DropSort・ClipShelf(新規) |
-| `modeshift.reverted`(新規) | ModeShift。元に戻す(手動・自動切替の on_exit・CLI)が終わったとき | `{"mode": str, "run_id": str}`(戻す前のモード名) | DropSort・ClipShelf |
+| `modeshift.switched`(既存) | ModeShift | `{"mode": str, "run_id": str, "failed": int}` | DropSort・ClipShelf(新規)・EyeBreak(v0.4) |
+| `modeshift.reverted`(新規) | ModeShift。元に戻す(手動・自動切替の on_exit・CLI)が終わったとき | `{"mode": str, "run_id": str}`(戻す前のモード名) | DropSort・ClipShelf・EyeBreak(v0.4) |
 | `host.snooze_changed`(新規) | 本体 | `{"snoozed": bool, "until": str \| None}`(ISO 8601、無期限は None) | 必要なモジュール(例: DropSort は再開時にフルスキャン) |
 | `layout.apply`(既存・拡張) | ModeShift | 既存の payload に任意の `"preset": str` を追加 | LayoutKeep |
 | `layout.applied`(既存) | LayoutKeep | 変更なし(`preset` を受けた場合は `"preset"` をそのまま返す) | ModeShift |

@@ -35,15 +35,21 @@ _LIGHT = dict(BG0="#F3F5FA", BG1="#FFFFFF", SURFACE="#FFFFFF", SURFACE2="#F2F4F9
               ACCENT_2="#9A62F2", SUCCESS="#0F9F6E", WARN="#B7791F", DANGER="#DC3B3B", INFO="#2F74D0",
               ON_ACCENT="#FFFFFF", HERO_GLYPH="#1B2233")
 # ライトテーマでは淡いアクセント色が白地で読みにくいので、モジュールの色を濃くする(ライトではグラフの色も兼ねる)
-# v0.3: 7 色を catalog の順に並べ、dataviz の validate_palette.js で確認済み(白・#F2F4F9 の両方の面で全項目 PASS。
-# 隣り合う組の色覚差 ΔE 最小 8.1(twinsweep↔pccheckup)、通常視 最小 16.0(pccheckup↔sendprep))
+# v0.4: 15 色を catalog の順に並べ、dataviz の validate_palette.js で確認済み(白・#F2F4F9 の両方の面で全項目 PASS。
+# 隣り合う組の色覚差 ΔE 最小 8.1(twinsweep↔pccheckup)、通常視 最小 16.0(pccheckup↔sendprep))。
+# v0.3 の7色はそのまま。新しい8色は、隣り合う組に加えて、ほかのどの色とも通常視 ΔE 10 以上(最小 10.1 cliptrim↔dropsort)
 _LIGHT_MODULE_ACCENTS = {"modeshift": "#7C4DDB", "dropsort": "#0E9C8C", "layoutkeep": "#2F74D0", "clipshelf": "#C27C0E",
-                         "sendprep": "#F4428D", "pccheckup": "#D45003", "twinsweep": "#258D48"}
+                         "sendprep": "#F4428D", "pccheckup": "#D45003", "twinsweep": "#258D48",
+                         "eyebreak": "#046990", "jotdrop": "#8A5100", "keyfree": "#422FD0", "startupwatch": "#C00F6D",
+                         "pagepress": "#CC3FFA", "mojifix": "#7B0BAB", "cliptrim": "#4C94C2", "plugsave": "#076945"}
 
 
-# ダーク用のグラフの色(同じ検証で #151A24・#1B2130 の両方の面で全項目 PASS。隣り合う組の色覚差 ΔE 最小 10.1、通常視 最小 15.5)
+# ダーク用のグラフの色(同じ検証で #151A24・#1B2130 の両方の面で全項目 PASS。隣り合う組の色覚差 ΔE 最小 9.4、通常視 最小 15.5)。
+# 新しい8色とほかの色の通常視 ΔE は最小 8.2(cliptrim↔dropsort。グラフは1系列1グラフなので並ばない)
 _CHART_DARK = {"modeshift": "#9575F0", "dropsort": "#17A594", "layoutkeep": "#4F8FE6", "clipshelf": "#C0820A",
-               "sendprep": "#AB448E", "pccheckup": "#BB461D", "twinsweep": "#3FAD1E"}
+               "sendprep": "#AB448E", "pccheckup": "#BB461D", "twinsweep": "#3FAD1E",
+               "eyebreak": "#1877A6", "jotdrop": "#836816", "keyfree": "#4E5EDB", "startupwatch": "#E7436B",
+               "pagepress": "#DB00BE", "mojifix": "#9D16FE", "cliptrim": "#2297BA", "plugsave": "#198352"}
 
 
 def chart_color(module: str) -> str:

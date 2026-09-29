@@ -64,6 +64,14 @@ def dist_licenses(sp: Path, dist: str) -> list[tuple[str, str]]:
     return [(str(p.relative_to(d)).replace("\\", "/"), read(p)) for p in files]
 
 
+def split_licenses(texts: list[tuple[str, str]], marker: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """marker を含むパスの物と、それ以外に分ける(pypdfium2 の wheel: 本体のライセンスと PDFium のビルドのライセンス)。"""
+    return [t for t in texts if marker not in t[0]], [t for t in texts if marker in t[0]]
+
+
+PDFIUM_VERSION = "chromium/7999(pypdfium2_raw の version.json: 153.0.7999.0、origin pdfium-binaries)"
+
+
 def gpl3_text(numpy_license: str) -> str:
     i = numpy_license.index("                    GNU GENERAL PUBLIC LICENSE\n                       Version 3")
     return numpy_license[i:]
@@ -76,6 +84,9 @@ def components(sp: Path) -> tuple[list[Component], str, str]:
     numpy_lic = dist_licenses(sp, "numpy-2.5.3")
     gpl3 = gpl3_text(dict(numpy_lic)["licenses/LICENSE.txt"])
     py_base = Path(sys.base_prefix)
+    pdfium_own, pdfium_build = split_licenses(dist_licenses(sp, "pypdfium2-5.13.0"), "BUILD_LICENSES")
+    if len(pdfium_build) != 16 or not any(t[0].endswith("BUILD_LICENSES/pdfium.txt") for t in pdfium_build):
+        raise SystemExit(f"pypdfium2 の BUILD_LICENSES の数が想定(16)と違います: {len(pdfium_build)}(版を確かめてください)")
     comps = [
         Component(
             "Qt 6 / Qt for Python (PySide6・Shiboken6)", "Qt 6.11.2 / PySide6-Essentials 6.11.2 / shiboken6 6.11.2",
@@ -146,6 +157,32 @@ def components(sp: Path) -> tuple[list[Component], str, str]:
              "Library Exception 3.1)の説明と、例外と GPL v3 の全文が含まれています。",
              "ソース: https://github.com/numpy/numpy/tree/v2.5.3"],
             numpy_lic,
+        ),
+        Component(
+            "pypdf(PagePress の PDF の結合・分割・回転)", "6.19.0", "BSD-3-Clause", "https://github.com/py-pdf/pypdf",
+            ["純 Python のライブラリです。ソース: https://github.com/py-pdf/pypdf/tree/6.19.0"],
+            dist_licenses(sp, "pypdf-6.19.0"),
+        ),
+        Component(
+            "pypdfium2(PagePress の PDF の表示・画像化)", "5.13.0", "Apache-2.0 または BSD-3-Clause(どちらかを選べる)。一部の文書は CC-BY-4.0",
+            "https://github.com/pypdfium2-team/pypdfium2",
+            ["PDFium を Python から呼ぶためのライブラリです。同梱の PDFium(pdfium.dll)は次の節にあります。",
+             "ソース: https://github.com/pypdfium2-team/pypdfium2/tree/5.13.0"],
+            pdfium_own,
+        ),
+        Component(
+            "PDFium(pdfium.dll。pypdfium2 に同梱)", PDFIUM_VERSION,
+            "BSD-3-Clause(PDFium)。ビルドに含まれるライブラリはそれぞれのライセンス",
+            "https://pdfium.googlesource.com/pdfium/",
+            ["DeskKit は PDFium を改変していません。pypdfium2 の wheel に入っているビルド(pdfium-binaries)をそのまま使います。",
+             "ビルド: https://github.com/bblanchon/pdfium-binaries/releases(chromium/7999。ビルドの手順は MIT License)",
+             "ソース: https://pdfium.googlesource.com/pdfium/+/refs/heads/chromium/7999",
+             "ビルドに含まれるライブラリ(wheel の BUILD_LICENSES の 16 ファイル。下に全文):",
+             "  PDFium(BSD-3-Clause)・pdfium-binaries(MIT)・Abseil(Apache-2.0)・Anti-Grain Geometry 2.3・fast_float(MIT)・",
+             "  FreeType(FreeType License)・ICU(Unicode License V3)・Little CMS(MIT)・libjpeg-turbo(IJG / BSD-3-Clause)・",
+             "  OpenJPEG(BSD-2-Clause)・libpng(PNG Reference Library License v2)・libtiff(libtiff License)・",
+             "  LLVM libc(Apache-2.0 with LLVM Exceptions)・simdutf(MIT)・zlib(zlib License)"],
+            pdfium_build,
         ),
         Component("psutil", "7.2.2", "BSD-3-Clause", "https://github.com/giampaolo/psutil",
                   ["ソース: https://github.com/giampaolo/psutil/tree/v7.2.2"], dist_licenses(sp, "psutil-7.2.2")),

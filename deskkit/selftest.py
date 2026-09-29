@@ -9,7 +9,9 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from deskkit.catalog import MODULE_NAMES
 
@@ -176,6 +178,9 @@ def run_host() -> int:
     from deskkit.hotkeys import format_hotkey, parse_hotkey
 
     _check(results, "ホットキー表記の往復", format_hotkey(*parse_hotkey("ctrl+shift+space")) == "Ctrl+Shift+Space")
+
+    # ---- v0.4(docs/INTERFACES_v0.4.md)
+    _check_v04(results, host, ctx, pump)
     _check(results, "AC-11 DPI awareness が Per-Monitor V2", dpi == "per_monitor_aware_v2", dpi)
 
     host.loader.stop_all()
@@ -184,6 +189,77 @@ def run_host() -> int:
     ng = [r for r in results if not r[1]]
     print(f"host selftest: {len(results) - len(ng)}/{len(results)} OK")
     return 0 if not ng else 1
+
+
+class _ProbeFakeApi:
+    """selftest 用の偽の Win32Api(本物の RegisterHotKey を呼ばない)。vk 0x87(F24)は「使用中」、それ以外は空き。"""
+
+    def __init__(self) -> None:
+        self.thread_held: set[int] = set()
+        self._err = 0
+
+    def register_hotkey(self, hwnd: int, hid: int, mods: int, vk: int) -> bool:
+        if vk == 0x87:
+            self._err = 1409
+            return False
+        if hwnd == 0:
+            self.thread_held.add(hid)
+        return True
+
+    def unregister_hotkey(self, hwnd: int, hid: int) -> bool:
+        self.thread_held.discard(hid)
+        return True
+
+    def get_last_error(self) -> int:
+        return self._err
+
+    def peek_message(self, msg_min: int, msg_max: int, remove: bool) -> tuple[int, int, int] | None:
+        return None
+
+
+def _check_v04(results: list[tuple[str, bool, str]], host: Any, ctx: Any, pump: Callable[[], None]) -> None:
+    if ctx is None:
+        _check(results, "H4-2 probe(偽の Win32Api)", False, "ctx が無い")
+        return
+    reg = host.hotkeys.registry
+    fake = _ProbeFakeApi()
+    real_api = reg._api
+    reg._api = fake
+    got: list[Any] = []
+    dones: list[Any] = []
+    try:
+        handle = ctx.hotkeys.probe([(0x3, 0x87), (0x7, 0x4B), (0x3, 0x4C)], got.append, dones.append, 2)
+        for _ in range(500):
+            pump()
+            if dones:
+                break
+            time.sleep(0.002)
+        states = [r.state for b in got for r in b.results]
+        _check(results, "H4-2 probe(偽の Win32Api)が GUI スレッドへ結果を返し、預かりを0に戻す",
+               states == ["used", "free", "free"] and bool(dones) and dones[-1].reason == "finished" and handle.done
+               and reg.probe_holding() == 0 and not fake.thread_held, f"{states} {dones}")
+    finally:
+        reg.cancel_probe(2.0)
+        reg._api = real_api
+    snap = ctx.hotkeys.snapshot()
+    fmt = ctx.hotkeys.format(0x7, 0x4B)
+    _check(results, "H4-3/H4-4 snapshot と format/parse",
+           isinstance(snap.held, list) and isinstance(snap.failed, list) and fmt == "Ctrl+Alt+Shift+K"
+           and ctx.hotkeys.parse(fmt) == (0x7, 0x4B) and ctx.hotkeys.parse("K") is None, fmt)
+
+    shown: list[str] = []
+    real_busy, real_show = host._foreground_busy, host._show_note
+    host._foreground_busy = lambda: True
+    host._show_note = lambda n: shown.append(n.title)
+    try:
+        ctx.notify("置き換え1", "", replace_key="selftest.k")
+        ctx.notify("置き換え2", "", replace_key="selftest.k")
+        n_held = host.hold.count
+        host._foreground_busy = lambda: False
+        host.hold._tick()
+        _check(results, "H4-6 replace_key が同じ通知は保留中に新しい方だけ残す", n_held == 1 and shown == ["置き換え2"], str(shown))
+    finally:
+        host._foreground_busy, host._show_note = real_busy, real_show
 
 
 def run_module(name: str) -> int:

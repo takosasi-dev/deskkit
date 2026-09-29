@@ -11,10 +11,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from deskkit.modules.pccheckup.checks.base import SEVERITY, STATUS_TEXT
+from deskkit.modules.pccheckup.checks.base import CATEGORIES, SEVERITY, STATUS_TEXT
 
 MAX_LINES = 200
-CATEGORIES = ("perf", "net", "storage")
+__all__ = ["CATEGORIES", "MAX_LINES", "History", "OpsLog", "worsened"]  # CATEGORIES に "boot" を含む(追加仕様書 §9)
 
 
 def _now() -> datetime:

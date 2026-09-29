@@ -161,6 +161,9 @@ def build_report(host: Any, now: _dt.datetime | None = None) -> str:
     hub = host.hotkeys
     regs = sorted(hub.registry.names())
     lines.append(f"登録: {len(regs)} 件")
+    reg = hub.registry
+    if hasattr(reg, "probe_active"):  # v0.4 の試して外す(件数と状態だけ)
+        lines.append(f"試して外す: {'動作中' if reg.probe_active() else 'なし'} / 預かり {reg.probe_holding()} 件")
     for n in regs:
         lines.append(f"- {scrub(n, 80)} = {hub.combo_text(n) or '?'}")
     failed = {n: t for n, t in getattr(hub, "failed", {}).items() if n not in regs}

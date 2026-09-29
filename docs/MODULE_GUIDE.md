@@ -36,11 +36,49 @@
   パスを積んで `ctx.show_page()` を呼び、`(0, "queued N")` を返す。1回で運べるのは 200 個・合計 32,000 文字まで(本体の IPC は 1MB まで受ける)。
   この経路で起動された host は画面を自分では開かない(モジュールの `show_page()` が開く)。受け取るモジュールが無効なら、本体が警告の通知を出して 11 を返す。
 - ログ・操作記録・`diagnostics()` にファイル名・フォルダのパス・SSID・文字認識で読んだ文字列を書かない(V-7・VINV-4。v0.2 の「本文・URL」より広い)。
-  画面には出してよい(V-8)。
+  画面には出してよい(V-8)。(v0.4)**利用者が書いた本文** も書かない(V4-1。§0.3)。
 - テーマ: 3モジュールのライト用アクセント色とグラフの色は `deskkit/ui/theme.py`(7 色で dataviz の検証を両テーマで PASS)。モジュールは従来どおり
   `catalog.info(name).accent` と `theme.chart_color(name)` を実行時に読むだけ。
 - 本体の設定画面に「ライセンス」(同梱の `THIRD_PARTY_LICENSES.txt` を表示。作り直しは `tools/make_third_party_licenses.py`)。ライブラリを足したら本体担当へ知らせる。
 - テストの `DESKKIT_HOME` を一時フォルダに向けた host は、IPC の名前も分かれる(本番の常駐に繋がない)。
+
+## 0.3 v0.4.0 の変更点
+
+- 担当間の取り決め: `docs/INTERFACES_v0.4.md`。共通仕様: `DeskKit_v0.4_追加モジュール共通_仕様書.md`(V4-* / H4-* / V4INV-* / NFR4-*)。
+  仕様書からの変更点・実測はモジュールごとの `docs/v0.4/<モジュール>.md`、本体は `docs/v0.4/measurements.md`。
+- 追加モジュール: EyeBreak(休憩の声かけ)・JotDrop(どこでも一行メモ)・KeyFree(空いているショートカット探し)・StartupWatch(自動起動の見張り)・
+  PagePress(PDF の手元作業)・MojiFix(文字化け直し)・ClipTrim(動画の切り出し)・PlugSave(挿すだけバックアップ)。PcCheckup に Secure Boot の証明書の確認。
+  8本とも既定は無効。色は `deskkit/ui/theme.py`(ライト・グラフ)と `deskkit/catalog.py`(ダークの画面)で、15 色を dataviz の検証で決めた。
+- **V-7 の広げ方(V4-1)**: ログ・操作記録・`diagnostics()`・`usage()` に書かない物に **利用者が書いた本文**(JotDrop のメモなど)を足す。
+  v0.3 までのファイル名・パス・SSID・文字認識の文字列に加えて、exe 名・自動起動の項目の名前とコマンドの行・キーの組み合わせの名前(KeyFree)も書かない。画面には出してよい(V-8)。
+- **ホットキーの試して外す(H4-2)**: `ctx.hotkeys.probe(combos, on_batch, on_done, batch=16) -> ProbeHandle`。型は `deskkit.hotkeys` から import する。
+  - host の registry が専用スレッドを1本作り、`hWnd` を NULL にして1組ずつ `RegisterHotKey` → 成功ならすぐ同じスレッドで `UnregisterHotKey`。
+    id は 0x8000〜0xBFFF を1組ごとに変える。`MOD_NOREPEAT` をつけて試す(普段の登録と同じ)。
+  - 結果 `ProbeResult(mods, vk, state, error)` の state は `free` / `used`(1409)/ `error`(それ以外。error に番号)/ `deskkit`(DeskKit 自身が持つ組。試さない)。
+    mods に `MOD_NOREPEAT` は入れない。
+  - `batch` 組ごとに `on_batch(ProbeBatch(results, pressed))`。`pressed` はそのバッチの間にこのスレッドへ届いた `WM_HOTKEY`(= 試している一瞬に押された組)。
+  - 終わると `on_done(ProbeDone(reason, checked, error))`。reason は `finished` / `cancelled` / `error` / `release_failed`(解除できなかった。error に番号)/ `busy`。
+    **終わり方によらず、預かり(試しの登録)を0に戻してから** on_done を呼ぶ。`ProbeHandle.done` はその時点で True。
+  - `on_batch` / `on_done` は **GUI スレッドで、probe() から戻った後に** 呼ぶ(ctx の safe で包む)。同時に動けるのは DeskKit 全体で1本で、2本目は試さずに
+    `on_done(ProbeDone("busy", 0))`。`ProbeHandle.cancel()` はどのスレッドからでも呼べ、次の組の前で止まる。
+  - モジュールが止まる(stop・無効化・再起動)と、host が probe を cancel して、預かりが0に戻るまで最大 2 秒待ってから片付ける。止まった後の on_batch / on_done は呼ばない。
+  - `handle_cli` は GUI スレッドで呼ばれる。CLI で結果を待つときは `QEventLoop` を回して待つ(GUI スレッドを塞ぐと on_done が届かない)。
+- **`ctx.hotkeys.snapshot() -> HotkeySnapshot`(H4-3)**: `held`(DeskKit が今持つ組。`HeldKey(name, mods, vk)`、name は `host.quick` / `jotdrop.open_input` のような登録名)と
+  `failed`(登録できなかった組。`FailedKey(name, mods, vk, error)`。1409 はほかのアプリが使っている)。表記を読めなかった設定は failed に入らない。
+  モジュールが `unregister(name)` した名前は failed から消える。
+- **`ctx.hotkeys.format(mods, vk) -> str` / `ctx.hotkeys.parse(text) -> (mods, vk) | None`(H4-4)**: `register_text` が受け付ける書き方(`Ctrl+Alt+Shift+K`)。
+  記号キーの名前は米国配列の刻印(`;` `=` `,` `-` `.` `/` `` ` `` `[` `\` `]` `'`)、`VK_OEM_102` は `OEM102`、名前の無いキーは `VKxx`(16進)。
+  parse は修飾キーが1つも無い書き方も None を返す(`register_text` と同じ規則)。
+- **Win32Api(H4-5)**: `overlaykit.hotkey.Win32Api` に `peek_message(msg_min, msg_max, remove)` を足した。`register_hotkey(0, ...)` は NULL の hWnd(呼んだスレッドに結び付く)。
+  registry のテストで偽物を作るときは4つのメソッドを持たせる(`tests/test_v04_host.py` の `FakeApi` が手本)。
+- **通知の置き換えの鍵(H4-6)**: `ctx.notify(title, text, on_click=None, level="info", replace_key=None)`。保留中(§9.1)に同じ `replace_key` の通知が来たら、
+  古い方を捨てて新しい方だけを残す(鍵はモジュールごとに分かれる)。保留していないときは普通に出す。「最近の通知」には両方が載る。
+- **ffmpeg の共通化**: SendPrep の中にあった ffmpeg の展開を `deskkit.ffmpeg` に移した(ClipTrim も使う)。API は `docs/INTERFACES_v0.4.md` §1.1。
+  展開先は `%LOCALAPPDATA%\DeskKit\ffmpeg\<sha16>\`。`ensure()` と `check_h264()` は GUI スレッドの外で呼ぶ。
+- **追加ライブラリ**: pypdf 6.19(BSD-3-Clause)と pypdfium2 5.13(Apache-2.0 / BSD-3-Clause。PDFium の `pdfium.dll` 入り)。**PagePress だけが使う**。
+  v0.3 と同じく `create()` と import 時には読まず、最初に使う関数の中で import する。exe には deskkit.spec が名前で入れている。PyMuPDF(AGPL)は使わない。
+  pypdf は `cryptography` を入れていないので、AES で暗号化された PDF は開けない(pypdf の `DependencyError`。RC4 の古い暗号化は開ける)。
+- ホームのホットキー一覧の表示名に `jotdrop.open_input` →「一行メモを書く」を足した(§9.5)。EyeBreak は `modeshift.switched` / `modeshift.reverted` の受け手(INTERFACES_v0.2 §2)。
 
 ## 1. パッケージ構成
 
@@ -57,7 +95,8 @@ tests/modules/<name>/   pytest(偽 Win32 で。実機依存は @pytest.mark.win3
 - 各ソースファイル先頭に責務を3行以内の日本語コメントで書く。
 - 他モジュールを import しない(C-1)。host の内部(`deskkit.host`, `deskkit.loader`, `deskkit.win32`)も import しない。
   使ってよい host 側: `deskkit.context`(型)、`deskkit.ui.*`(GUI 部品)、`deskkit.hotkeys`(parse_hotkey/format_hotkey)、`deskkit.catalog`(自分のアクセント色)、`deskkit.foreground.ForegroundInfo`(型)、`deskkit.usage`(§7)、
-  (v0.3)`deskkit.fileops`(`recycle` / `RecycleResult` / `RecycleApi`。ファイルをごみ箱へ送るのはこれだけ。§0.2)。
+  (v0.3)`deskkit.fileops`(`recycle` / `RecycleResult` / `RecycleApi`。ファイルをごみ箱へ送るのはこれだけ。§0.2)、
+  (v0.4)`deskkit.hotkeys` の型(`ProbeResult` / `ProbeBatch` / `ProbeDone` / `ProbeHandle` / `HeldKey` / `FailedKey` / `HotkeySnapshot`)、`deskkit.ffmpeg`(§0.3)。
 - Win32 は各モジュールの `_win32.py` に ctypes で書き、`Protocol` の背後に置いてテストで偽物に差し替える。argtypes/restype を必ず設定する(64bit で HANDLE が切れるのを防ぐ)。
 
 ## 2. Module の形
@@ -89,11 +128,14 @@ class Module:
 | `ctx.add_tray_action(label, cb, checkable=False, checked=False, submenu=None) -> TrayItem` | トレイの自モジュールのサブメニューに項目。`submenu="モード"` で入れ子。`TrayItem.set_text/set_checked/set_enabled/set_visible` |
 | `ctx.add_tray_separator(submenu=None)` / `ctx.clear_tray_actions(submenu=None)` | 区切り / 作り直し用の全消去 |
 | `ctx.set_tray_status(text)` | サブメニュー先頭の状態行。Control Center のカードにも出る |
-| `ctx.notify(title, text, on_click=None, level="info")` | 通知トースト(level: info/ok/warn/error)。on_click はクリック時のみ。(v0.2)ゲーム・全画面の間は error 以外を host が保留し、あとでまとめて出す(§9.1)。「最近の通知」の行クリックでは、10 分以内でモジュールが動いていれば on_click、それ以外は自分の画面が開く |
+| `ctx.notify(title, text, on_click=None, level="info", replace_key=None)` | 通知トースト(level: info/ok/warn/error)。(v0.4)`replace_key` は保留中の同じ鍵の通知を置き換える(§0.3)。on_click はクリック時のみ。(v0.2)ゲーム・全画面の間は error 以外を host が保留し、あとでまとめて出す(§9.1)。「最近の通知」の行クリックでは、10 分以内でモジュールが動いていれば on_click、それ以外は自分の画面が開く |
 | `ctx.hotkeys.register_text(name, "Ctrl+Shift+Space") -> bool` | 表記で登録。空/None なら何もしない。競合・解釈不能は False(host が起動時にまとめて通知する。FR-9) |
 | `ctx.hotkeys.register(name, mods, vk)` | 数値で登録。競合は `overlaykit.HotkeyConflictError` |
 | `ctx.hotkeys.triggered(name).connect(cb)` / `ctx.hotkeys.unregister(name)` | 押されたときのコールバック(safe 済み) |
-| `ctx.on_native(msg, handler(wparam, lparam))` | 隠しウィンドウのメッセージ購読(WM_DISPLAYCHANGE=0x007E, WM_POWERBROADCAST=0x0218, WM_CLIPBOARDUPDATE=0x031D) |
+| `ctx.hotkeys.probe(combos, on_batch, on_done, batch=16) -> ProbeHandle` | (v0.4)組み合わせを host の専用スレッドで「登録してすぐ外す」で調べる。結果は GUI スレッドへ(§0.3) |
+| `ctx.hotkeys.snapshot() -> HotkeySnapshot` | (v0.4)DeskKit(host と全モジュール)が持つ組と、登録できなかった組(エラー番号つき) |
+| `ctx.hotkeys.format(mods, vk) -> str` / `ctx.hotkeys.parse(text)` | (v0.4)`register_text` と同じ書き方との相互変換。parse は読めなければ None |
+| `ctx.on_native(msg, handler(wparam, lparam))` | 隠しウィンドウのメッセージ購読(WM_DISPLAYCHANGE=0x007E, WM_POWERBROADCAST=0x0218, WM_CLIPBOARDUPDATE=0x031D、(v0.4)WM_DEVICECHANGE=0x0219。隠しウィンドウはトップレベルなので DBT_DEVICEARRIVAL などのブロードキャストが届く見込み。lparam のポインタは handler の中でだけ読める。実機での確認は PlugSave) |
 | `ctx.hidden_hwnd()` | host の隠しウィンドウ(クリップボードの OpenClipboard の所有者などに使う) |
 | `ctx.foreground() -> ForegroundInfo` | `hwnd pid exe is_game is_fullscreen is_elevated` と `unsafe_for_input()`、`reason()`(game/fullscreen/elevated/...)。全画面判定は host が矩形一致で実装済み(False/True が返る) |
 | `ctx.emit(event, payload)` / `ctx.on(event, handler)` | 登録済みイベント: `layout.apply` / `layout.applied` / `modeshift.switched` /(v0.2)`modeshift.reverted` / `host.snooze_changed`。payload は `docs/INTERFACES_v0.2.md` §2 |

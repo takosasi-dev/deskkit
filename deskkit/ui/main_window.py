@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPlainTextEdit,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
 
 from deskkit import APP_NAME, __version__, autostart, catalog, paths
 from deskkit.foreground import query_foreground
+from deskkit.hotkeys import HOTKEY_LABELS, hotkey_label  # noqa: F401 - HOTKEY_LABELS は v0.3 までの置き場所からの読み込み用
 from deskkit.logging_setup import memory_tail
 from deskkit.settings import SettingsError
 from deskkit.ui import icons
@@ -168,10 +170,13 @@ class Indicator(QWidget):
         p.fillPath(bar, self._color)
 
 
+SIDEBAR_WIDTH = 236
+
+
 class Sidebar(QFrame):
     def __init__(self, on_select: Any) -> None:
         super().__init__()
-        self.setFixedWidth(236)
+        self.setMinimumWidth(SIDEBAR_WIDTH - 12)  # 幅は外側のスクロール枠が決める(縦のスクロールバーが出た分だけ狭くなる)
         self.setStyleSheet(f"Sidebar, QFrame#SidebarRoot {{ background: {T.BG1}; border-right: 1px solid {T.BORDER}; }}")
         self.setObjectName("SidebarRoot")
         self._on_select = on_select
@@ -240,33 +245,11 @@ class Sidebar(QFrame):
 
 # ================================================================== ホーム
 HOTKEY_LIMIT = 12
-# ホットキーの表示名(登録名 → 画面に出す名前)。知らない名前は登録名をそのまま読みやすくして出す
-HOTKEY_LABELS = {
-    "host.quick": "クイックアクション",
-    "clipshelf.open_palette": "パレットを開く",
-    "clipshelf.plain_text": "書式なしで貼り付け",
-    "clipshelf.toggle_pause": "記録の一時停止/再開",
-    "dropsort.undo_last": "直前の移動を元に戻す",
-    "modeshift.undo": "モードを元に戻す",
-    "layoutkeep.save": "今の配置を保存",
-    "layoutkeep.apply": "配置を適用",
-}
 
 
 def greeting(now: _dt.datetime | None = None) -> str:
     hour = (now or _dt.datetime.now()).hour
     return "おはようございます" if 5 <= hour < 11 else ("こんにちは" if 11 <= hour < 18 else "こんばんは")
-
-
-def hotkey_label(full: str, modes: dict[str, str]) -> str:
-    """'modeshift.mode.game' → 'モード「ゲーム」に切り替え' など、ホットキーの登録名を画面向けの名前にする。"""
-    if full in HOTKEY_LABELS:
-        return HOTKEY_LABELS[full]
-    mod, _, rest = full.partition(".")
-    if mod == "modeshift" and rest.startswith("mode."):
-        name = rest[len("mode."):]
-        return f"モード「{modes.get(name, name)}」に切り替え"
-    return rest.replace("_", " ").replace(".", " › ") or full
 
 
 class _Clickable(QFrame):
@@ -1163,7 +1146,16 @@ class ControlCenter(QMainWindow):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
         self.sidebar = Sidebar(self.open_page)
-        rl.addWidget(self.sidebar)
+        # v0.4: モジュールが 15 になり、サイドバーだけで高さが 930px を超えるので、スクロールできる枠に入れる(低い画面でも窓が収まる)
+        self.side_scroll = QScrollArea()
+        self.side_scroll.setObjectName("SidebarScroll")
+        self.side_scroll.setWidget(self.sidebar)
+        self.side_scroll.setWidgetResizable(True)
+        self.side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.side_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.side_scroll.setFixedWidth(SIDEBAR_WIDTH)
+        self.side_scroll.setStyleSheet(f"QScrollArea#SidebarScroll {{ background: {T.BG1}; border: none; }}")
+        rl.addWidget(self.side_scroll)
         self.stack = FadeStack()
         rl.addWidget(self.stack, 1)
         self.setCentralWidget(root)
@@ -1197,6 +1189,7 @@ class ControlCenter(QMainWindow):
         if key not in self.pages:
             return
         self.sidebar.select(key, animate)
+        self.side_scroll.ensureWidgetVisible(self.sidebar.items[key], 0, 8)
         self.stack.switch_to(self.pages[key])
         if key == "home":
             self.home.refresh()

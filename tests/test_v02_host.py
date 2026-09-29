@@ -192,6 +192,9 @@ class _FakeApi:
     def get_last_error(self) -> int:
         return 0
 
+    def peek_message(self, msg_min: int, msg_max: int, remove: bool) -> tuple[int, int, int] | None:
+        return None
+
 
 def _fake_host(tmp_path: Path) -> Any:
     from deskkit.hotkeys import HotkeyHub
@@ -207,6 +210,7 @@ def _fake_host(tmp_path: Path) -> Any:
     hub = HotkeyHub.__new__(HotkeyHub)
     hub.registry = HotkeyRegistry(0, _FakeApi())
     hub.conflicts, hub.combos, hub.failed, hub._callbacks = [], {}, {}, {}
+    hub.failed_keys = {}  # v0.4
     hub.register("host.quick", 0x3, 0x20)
     hub.note_conflict("clipshelf.plain_text", "Ctrl+Shift+V")
 

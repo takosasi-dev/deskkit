@@ -188,13 +188,14 @@ class Host:
         return APP_NAME if name == "host" else catalog.info(name).title
 
     def notify(self, source: str, title: str, text: str, on_click: Callable[[], Any] | None, *, level: str = "info",
-               alive: Callable[[], bool] | None = None) -> None:
-        """通知を記録してトーストで出す。ゲーム・全画面中は error 以外を保留する(H1。記録はすぐに行う)。"""
+               alive: Callable[[], bool] | None = None, replace_key: str | None = None) -> None:
+        """通知を記録してトーストで出す。ゲーム・全画面中は error 以外を保留する(H1。記録はすぐに行う)。
+        (v0.4 H4-6)保留中に同じ送り主・同じ replace_key の通知があれば、古い方を捨てて新しい方だけを残す。"""
         act = Activity(_dt.datetime.now(), source, title, level, on_click, alive)
         self.activities.insert(0, act)
         del self.activities[60:]
         self.signals.activity.emit(act)
-        note = Note(source, title, text, on_click, level, act.ts)
+        note = Note(source, title, text, on_click, level, act.ts, replace_key)
         if self.hold.offer(note):
             log.info("notify held source=%s level=%s", source, level)  # 種類だけ(INV-7)
             return

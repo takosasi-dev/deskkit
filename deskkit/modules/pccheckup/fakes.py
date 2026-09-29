@@ -13,16 +13,27 @@ from deskkit.modules.pccheckup.probes import (
     ConnInfo,
     CpuSample,
     DiskInfo,
+    Firmware,
     FolderSize,
     MemInfo,
     PowerInfo,
     ProcUsage,
     ProxyInfo,
+    RegRead,
+    SecureBootRaw,
     SizeInfo,
     StartupInfo,
 )
 
 WIFI_ID = "11111111-2222-3333-4444-555555555555"
+
+
+def sb_raw(firmware: str = "uefi", sb: RegRead | None = None, status: RegRead | None = None,
+           error: RegRead | None = None, capable: RegRead | None = None) -> SecureBootRaw:
+    """起動の安全の読み取り結果を作る。既定は「UEFI・有効・更新済み・Error なし・Capable 2」(この PC の実測と同じ形)。"""
+    fw: Firmware = "uefi" if firmware == "uefi" else "bios" if firmware == "bios" else "unknown"
+    return SecureBootRaw(fw, sb or RegRead("ok", 1), status or RegRead("ok", "Updated"), error or RegRead("missing"),
+                         capable or RegRead("ok", 2))
 
 
 def _adapter() -> AdapterInfo:
@@ -52,6 +63,7 @@ class FakeProbes:
         FolderSize("Pictures", "C:\\Users\\someone\\Pictures", SizeInfo(5 * GiB, 300)),
     ])
     sense: bool = True
+    sb: SecureBootRaw = field(default_factory=sb_raw)
     raise_on: set[str] = field(default_factory=set)
     calls: list[str] = field(default_factory=list)
 
@@ -123,3 +135,7 @@ class FakeProbes:
     def storage_sense(self) -> bool:
         self._hit("storage_sense")
         return self.sense
+
+    def secure_boot(self) -> SecureBootRaw:
+        self._hit("secure_boot")
+        return self.sb

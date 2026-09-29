@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, Signal
 
+from deskkit import ffmpeg as _ff
 from deskkit.catalog import info
 from deskkit.modules.sendprep import config as cfgmod
 from deskkit.modules.sendprep import jobs as J
@@ -78,7 +79,10 @@ class SendPrepModule:
         self._now: Callable[[], datetime] = now or datetime.now
         self.signals = Signals()
         self.ops = OpsLog(Path(ctx.data_dir) / "ops.jsonl")
-        self.ffmpeg = FfmpegManager(Path(ctx.data_dir), bundle or bundled_dir, self.log)
+        # 本番は本体の共通の展開先(ClipTrim と共有)。テストで bundle を渡したときは自分の data_dir の下
+        self._legacy_ffmpeg = Path(ctx.data_dir) / "ffmpeg" if bundle is None else None
+        self.ffmpeg = FfmpegManager(Path(ctx.data_dir), bundle or bundled_dir, self.log,
+                                    root=_ff.shared_root() if bundle is None else None)
         self._shell_link = shell_link
         self._sendto_folder = sendto_folder
         self._ocr_find = ocr_find
@@ -108,6 +112,9 @@ class SendPrepModule:
         self.ctx.add_tray_action("SendPrep を開く", self.ctx.show_page)
         self.ctx.add_tray_action("クリップボードの画像を整える", self.open_clipboard_editor)
         self._update_status()
+        if self._legacy_ffmpeg is not None and self._legacy_ffmpeg.is_dir():
+            # v0.3 の展開先に残った DeskKit 自身の ffmpeg.exe(約 134MB)を片づける
+            threading.Thread(target=_ff.cleanup_legacy, args=(self._legacy_ffmpeg,), daemon=True).start()
         self.log.info("sendprep started presets=%d", len(self.config.presets))
 
     def stop(self) -> None:

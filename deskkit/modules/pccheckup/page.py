@@ -37,7 +37,7 @@ from deskkit.modules.pccheckup.checks.base import (
     fmt_bytes,
 )
 from deskkit.modules.pccheckup.module import CATEGORY_GLYPHS
-from deskkit.modules.pccheckup.runner import BY_CATEGORY
+from deskkit.modules.pccheckup.runner import BOOT, BY_CATEGORY, RUNNABLE
 from deskkit.ui import theme as T
 from deskkit.ui import widgets as W
 from deskkit.ui.theme import G
@@ -422,8 +422,8 @@ class PcCheckupPage(W.ScrollPage):
         self.watch_pill = W.StatusPill("空き容量を見張り中", "info")
         hero.add_pill(self.state_pill)
         hero.add_pill(self.watch_pill)
-        self.all_btn = W.button("まとめて診断", "primary", GLYPH_DIAG, on_click=_guard(lambda: self.m.run(list(BY_CATEGORY))))
-        self.all_btn.setToolTip("重い・ネット・容量の3つを続けて調べます")
+        self.all_btn = W.button("まとめて診断", "primary", GLYPH_DIAG, on_click=_guard(self.m.run_all))
+        self.all_btn.setToolTip("重い・ネット・容量(と起動の安全)を続けて調べます")
         hero.add_action(self.all_btn)
         self.add(hero)
 
@@ -440,6 +440,16 @@ class PcCheckupPage(W.ScrollPage):
             lay.addWidget(b, 1)
             self.cat_btns[cat] = b
         self.add(box)
+        # SB-FR-1: 3つの大きなボタンの下の小さなボタン。secureboot_check が false なら出さない
+        self.boot_row = QWidget()
+        br = QHBoxLayout(self.boot_row)
+        br.setContentsMargins(2, 0, 0, 0)
+        br.setSpacing(10)
+        self.boot_btn = W.button("起動の安全を調べる", "secondary", G.SHIELD, on_click=_guard(lambda: self.m.run([BOOT])))
+        self.boot_btn.setToolTip("セキュア ブートと、起動の証明書が新しくなっているかを読みます。何も変えません")
+        br.addWidget(self.boot_btn)
+        br.addWidget(W.label("セキュア ブートと起動の証明書(2023 年版)を確かめます(2 秒ほど)", "Mute", wrap=True), 1)
+        self.add(self.boot_row)
 
     def _build_progress(self) -> None:
         c = W.Card(None, padding=16)
@@ -511,6 +521,14 @@ class PcCheckupPage(W.ScrollPage):
         self.watch_toggle.toggled.connect(self._on_watch)
         c.add(W.SettingRow("見張る", "通知は同じ状態で 24 時間に 1 回まで。一時停止中は読みません。", self.watch_toggle))
         self.add(c)
+        # B-9: 起動の安全の確認を丸ごと隠せる(設定 secureboot_check)
+        sb = W.Card("起動の安全の確認", "セキュア ブートと、起動の証明書(2023 年版)への更新を読むだけです。何も変えません。",
+                    G.SHIELD, _acc())
+        self.sb_toggle = W.ToggleSwitch(self.m.secureboot_check, _acc())
+        self.sb_toggle.toggled.connect(self._on_sb_toggle)
+        sb.add(W.SettingRow("起動の安全も調べる", "オフにすると、ボタン・「まとめて診断」・クイックアクションから外します。",
+                            self.sb_toggle))
+        self.add(sb)
 
     def _build_history(self) -> None:
         c = W.Card("これまでの診断", "時刻・カテゴリ・判定の数だけを残しています(最新 200 件)。", G.CLOCK, _acc())
@@ -527,14 +545,16 @@ class PcCheckupPage(W.ScrollPage):
         for b in self.cat_btns.values():
             b.setEnabled(not running)
         self.all_btn.setEnabled(not running)
+        self.boot_btn.setEnabled(not running)
+        self.boot_row.setVisible(self.m.secureboot_check)
         self.progress_card.setVisible(running)
         self.copy_btn.setEnabled(not running and any(st.results.values()))
         if running:
             self.state_pill.set_state("accent", "診断中")
             if not self._spin_timer.isActive():
                 self._spin_timer.start()
-            total = sum(len(BY_CATEGORY[c]) for c in st.categories)
-            done = sum(len(v) for v in st.results.values()) + sum(len(BY_CATEGORY[c]) - len(st.results.get(c, []))
+            total = sum(len(RUNNABLE[c]) for c in st.categories)
+            done = sum(len(v) for v in st.results.values()) + sum(len(RUNNABLE[c]) - len(st.results.get(c, []))
                                                                   for c in st.cancelled)
             self.bar.setMaximum(max(1, total))
             self.bar.setValue(min(total, done))
@@ -713,7 +733,15 @@ class PcCheckupPage(W.ScrollPage):
     @_guard
     def _refresh_watch(self) -> None:
         self.watch_toggle.set_checked_silent(self.m.watch_disk)
+        self.sb_toggle.set_checked_silent(self.m.secureboot_check)
         self._refresh_state()
+
+    @_guard
+    def _on_sb_toggle(self, on: bool) -> None:
+        err = self.m.set_secureboot_check(bool(on))
+        if err:
+            self.sb_toggle.set_checked_silent(self.m.secureboot_check)
+            W.message(self._parent(), "保存できませんでした", err, kind="error")
 
     # ---- 履歴
     def history_rows(self) -> int:

@@ -1,6 +1,6 @@
 # PcCheckup が読む Win32 API(ctypes)。読むだけで、設定・プロセス・サービスを変える関数は定義しない(INV-2)。
-# GetAdaptersAddresses・SHQueryRecycleBinW・GetSystemPowerStatus・PowerGetEffectiveOverlayScheme・既知フォルダ・ドライブの空き。
-# 定数値は Windows SDK のヘッダ(iptypes.h / shellapi.h / winbase.h / KnownFolders.h / fileapi.h)に合わせる。argtypes は必ず設定する。
+# GetAdaptersAddresses・SHQueryRecycleBinW・GetSystemPowerStatus・PowerGetEffectiveOverlayScheme・既知フォルダ・ドライブの空き・GetFirmwareType。
+# 定数値は Windows SDK のヘッダ(iptypes.h / shellapi.h / winbase.h / winnt.h / KnownFolders.h / fileapi.h)に合わせる。argtypes は必ず設定する。
 from __future__ import annotations
 
 import ctypes
@@ -34,6 +34,10 @@ BATTERY_FLAG_NO_BATTERY = 128
 BATTERY_FLAG_UNKNOWN = 255
 AC_LINE_OFFLINE = 0
 SYSTEM_STATUS_FLAG_SAVER_ON = 1
+# --- winnt.h: FIRMWARE_TYPE(GetFirmwareType の結果)
+FIRMWARE_TYPE_UNKNOWN = 0
+FIRMWARE_TYPE_BIOS = 1
+FIRMWARE_TYPE_UEFI = 2
 # --- KnownFolders.h: FOLDERID_Downloads
 FOLDERID_DOWNLOADS = "{374DE290-123F-4565-9164-39C4925E467B}"
 
@@ -164,6 +168,8 @@ def _bind() -> None:
     _ole.CoTaskMemFree.restype = None
     _powr.PowerGetEffectiveOverlayScheme.argtypes = [ctypes.POINTER(_GUID)]
     _powr.PowerGetEffectiveOverlayScheme.restype = w.DWORD
+    _k32.GetFirmwareType.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    _k32.GetFirmwareType.restype = w.BOOL
     _bound = True
 
 
@@ -310,3 +316,13 @@ def known_folder(folder_id: str) -> str | None:
     finally:
         if p:
             _ole.CoTaskMemFree(ctypes.cast(p, ctypes.c_void_p))
+
+
+# ------------------------------------------------------------------ 起動方式(B1)
+def firmware_type() -> str:
+    """GetFirmwareType の結果を "uefi" / "bios" / "unknown" で返す。失敗・Unknown・知らない値は "unknown"(§10)。読むだけ。"""
+    _bind()
+    ft = ctypes.c_int(FIRMWARE_TYPE_UNKNOWN)
+    if not _k32.GetFirmwareType(ctypes.byref(ft)):
+        return "unknown"
+    return {FIRMWARE_TYPE_UEFI: "uefi", FIRMWARE_TYPE_BIOS: "bios"}.get(int(ft.value), "unknown")

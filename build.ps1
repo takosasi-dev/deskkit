@@ -1,8 +1,11 @@
 ﻿# DeskKit を単体 exe にビルドする。出力: dist\DeskKit.exe(と一つ上のフォルダへの配布用コピー)
 # v0.3: SendPrep が使う ffmpeg(LGPL 版)を同梱する。配布物は自動でダウンロードせず、手で third_party\ffmpeg\ に置く(H-6)。
+# v0.4: PagePress の pypdf・pypdfium2(pdfium.dll)を同梱する(deskkit.spec が venv から集める)。
+#       -NoCopy: 一つ上のフォルダへの配布用コピーをしない。-Python: 使う python.exe(既定は .venv)。どちらも worktree での試しのビルド用。
+param([switch]$NoCopy, [string]$Python = ".\.venv\Scripts\python.exe")
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
-$py = ".\.venv\Scripts\python.exe"
+$py = $Python
 
 # ---- ffmpeg の同梱物(deskkit\_bundled\ffmpeg.zip と ffmpeg.sha256)
 $ffName = "ffmpeg-n8.1-latest-win64-lgpl-8.1.zip"
@@ -57,7 +60,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 $hash = (Get-FileHash dist\DeskKit.exe -Algorithm SHA256).Hash.ToLower()
 "$hash  DeskKit.exe" | Set-Content -Encoding ascii -NoNewline dist\DeskKit.exe.sha256
-Copy-Item dist\DeskKit.exe ..\DeskKit.exe -Force
+if (-not $NoCopy) {
+    Copy-Item dist\DeskKit.exe ..\DeskKit.exe -Force
+}
 Write-Host "sha256 $hash"
 Write-Host "size $([math]::Round((Get-Item dist\DeskKit.exe).Length / 1MB, 1)) MB"
 Write-Host "built dist\DeskKit.exe (v$ver)"

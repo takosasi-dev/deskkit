@@ -18,11 +18,12 @@ from PySide6.QtCore import QObject, Signal
 
 from deskkit.catalog import info
 from deskkit.modules.pccheckup import cleanup
+from deskkit.modules.pccheckup.checks import boot
 from deskkit.modules.pccheckup.checks.base import CATEGORIES, STATUS_ORDER, Action, Cancel, Finding, fmt_bytes
 from deskkit.modules.pccheckup.history import History, OpsLog, worsened
 from deskkit.modules.pccheckup.probes import DiskInfo, Probes, RealProbes
 from deskkit.modules.pccheckup.report import Secrets, build
-from deskkit.modules.pccheckup.runner import ALL_IDS, BY_CATEGORY, CategoryResult, run_category
+from deskkit.modules.pccheckup.runner import BOOT, BY_CATEGORY, HISTORY_IDS, RUNNABLE, CategoryResult, run_category
 from deskkit.modules.pccheckup.watcher import DiskWatcher
 from deskkit.usage import UsageSeries, count_jsonl
 
@@ -31,12 +32,14 @@ if TYPE_CHECKING:
 
     from deskkit.fileops import RecycleResult
 
-DEFAULTS: dict[str, Any] = {"watch_disk": False}
+DEFAULTS: dict[str, Any] = {"watch_disk": False, "secureboot_check": True}
 STOP_WAIT_S = 60.0  # §10: ごみ箱送りの最中に終了したら、recycle の呼び出しが終わるまで待つ
-# FR-10: action のボタンが開いてよいもの(本書の表の URI とごみ箱)。これ以外は開かない
+# FR-10: action のボタンが開いてよいもの(本書の表の URI とごみ箱)。これ以外は開かない。
+# SB-FR-6: Windows Update と Windows セキュリティを足す(B の action はこの2つだけ)
 ALLOWED_URIS: frozenset[str] = frozenset({
     "ms-settings:startupapps", "ms-settings:powersleep", "ms-settings:network-status", "ms-settings:network-wifi",
     "ms-settings:network-proxy", "ms-settings:storagesense", "shell:RecycleBinFolder",
+    boot.URI_WINDOWS_UPDATE, boot.URI_WINDOWS_SECURITY,
 })
 TASKMGR = "taskmgr.exe"
 CATEGORY_GLYPHS: dict[str, str] = {"perf": "", "net": "", "storage": ""}
@@ -45,6 +48,9 @@ QUICK_ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("net", "ネットの不調を調べる", "pccheckup ネット wifi インターネット つながらない 診断"),
     ("storage", "容量を調べる", "pccheckup 容量 空き ディスク ストレージ 診断"),
 )
+# SB-FR-7: secureboot_check が true のときだけ足す
+BOOT_QUICK_ACTION = ("起動の証明書を調べる", "pccheckup 起動 セキュアブート secure boot 証明書 2023 診断")
+CATEGORY_GLYPHS["boot"] = ""  # Segoe Fluent Icons の Shield(theme.G.SHIELD と同じ字形)
 
 
 class Notifier(QObject):
@@ -67,6 +73,7 @@ class RunState:
     done: set[str] = field(default_factory=set)
     failed: list[str] = field(default_factory=list)
     worse: set[str] = field(default_factory=set)
+    suffixes: dict[str, str] = field(default_factory=dict)   # B1・B2 のコピーに付ける生の値(画面・コピーだけ)
     progress_text: str = ""
     progress_category: str = ""
     step: int = 0
@@ -119,13 +126,15 @@ class PcCheckupModule:
             except Exception as e:  # noqa: BLE001 - 書き戻せなくても既定値で動く
                 self.log.warning("既定値の書き戻しに失敗: %s", type(e).__name__)
         self.watch_disk: bool = bool(merged["watch_disk"])
+        self.secureboot_check: bool = bool(merged["secureboot_check"])
+        self._sb_reasons: tuple[str, str] | None = None     # 最後の B1・B2 の理由コード(diagnostics 用。SB-FR-8)
         self._probes_factory: Callable[[], Probes] = probes_factory or (lambda: RealProbes(now))
         self._recycle: cleanup.RecycleFn = recycle_fn or _default_recycle
         self._threaded = threaded
         self._now = now
         self._startfile: Callable[[str], None] = startfile or _default_startfile
         self.notifier = Notifier()
-        self.history = History(ctx.data_dir / "history.jsonl", ALL_IDS)
+        self.history = History(ctx.data_dir / "history.jsonl", HISTORY_IDS)
         self.ops = OpsLog(ctx.data_dir / "ops.jsonl")
         self.state = RunState()
         self._prev: dict[str, dict[str, str] | None] = {}
@@ -141,15 +150,23 @@ class PcCheckupModule:
     # ================================================================ ライフサイクル
     def start(self) -> None:
         self._stopping = False
-        add = getattr(self.ctx, "add_quick_action", None)
-        if add is not None:  # FR-13
-            for cat, label, kw in QUICK_ACTIONS:
-                add(label, partial(self.open_and_run, cat), keywords=kw, glyph=CATEGORY_GLYPHS[cat],
-                    enabled=lambda: not self.state.running)
+        self._add_quick_actions()
         if self.watch_disk:
             self.watcher.start()
         self._update_status()
-        self.log.info("pccheckup started watch_disk=%s", self.watch_disk)
+        self.log.info("pccheckup started watch_disk=%s secureboot_check=%s", self.watch_disk, self.secureboot_check)
+
+    def _add_quick_actions(self) -> None:
+        add = getattr(self.ctx, "add_quick_action", None)
+        if add is None:
+            return
+        for cat, label, kw in QUICK_ACTIONS:  # FR-13
+            add(label, partial(self.open_and_run, cat), keywords=kw, glyph=CATEGORY_GLYPHS[cat],
+                enabled=lambda: not self.state.running)
+        if self.secureboot_check:  # SB-FR-7
+            label, kw = BOOT_QUICK_ACTION
+            add(label, partial(self.open_and_run, BOOT), keywords=kw, glyph=CATEGORY_GLYPHS[BOOT],
+                enabled=lambda: not self.state.running)
 
     def stop(self) -> None:
         self._stopping = True
@@ -181,14 +198,21 @@ class PcCheckupModule:
             show()
         self.run([category])
 
+    def all_categories(self) -> list[str]:
+        """「まとめて診断」の順(SB-FR-2): 重い → ネット → 容量 → 起動の安全(secureboot_check が true のときだけ)。"""
+        return [*BY_CATEGORY, *([BOOT] if self.secureboot_check else [])]
+
+    def run_all(self) -> bool:
+        return self.run(self.all_categories())
+
     def run(self, categories: Sequence[str]) -> bool:
-        """診断を始める。実行中なら何もしない(FR-2: ボタンは無効)。"""
-        cats = [c for c in categories if c in BY_CATEGORY]
+        """診断を始める。実行中なら何もしない(FR-2: ボタンは無効)。secureboot_check が false なら起動の安全は行わない(SB-AC-7)。"""
+        cats = [c for c in categories if c in RUNNABLE and (c != BOOT or self.secureboot_check)]
         if self.state.running or not cats or self._stopping:
             return False
         self._cancel = Cancel()
         self.state = RunState(running=True, categories=cats, results={c: [] for c in cats},
-                              started=datetime.fromtimestamp(self._now()).astimezone(), total=len(BY_CATEGORY[cats[0]]),
+                              started=datetime.fromtimestamp(self._now()).astimezone(), total=len(RUNNABLE[cats[0]]),
                               progress_category=cats[0])
         self._prev = {c: self.history.last(c) for c in cats}
         self.log.info("diagnosis start categories=%s", ",".join(cats))
@@ -227,6 +251,8 @@ class PcCheckupModule:
                     on_progress=lambda c, i, n, t: self._post(partial(self._on_progress, c, i, n, t)),
                     on_finding=lambda c, f: self._post(partial(self._on_finding, c, f)),
                 )
+                if cat == BOOT and not res.cancelled:
+                    self._post(partial(self._on_boot_read, *self._boot_info(probes)))
                 self._post(partial(self._on_category_done, res))
             ssid = self._peek_ssid(probes)
             if ssid:
@@ -244,6 +270,21 @@ class PcCheckupModule:
             v = getattr(memo["conn"][1], "ssid", None)
             return v if isinstance(v, str) else None
         return None
+
+    @staticmethod
+    def _boot_info(probes: Probes) -> tuple[tuple[str, str], dict[str, str]]:
+        """B1・B2 の理由コードと、コピーに付ける生の値。値はチェックで読んだものを使い回す(RealProbes は覚えている)。
+        読めなければ理由コードは "error"(チェックは runner が unknown にしている)。"""
+        try:
+            raw = probes.secure_boot()
+        except Exception:  # noqa: BLE001 - 理由コードが取れないだけで、結果はもう出ている
+            return ("error", "error"), {}
+        return boot.reasons(raw, boot.today()), boot.suffixes(raw)
+
+    def _on_boot_read(self, reasons: tuple[str, str], suffixes: dict[str, str]) -> None:
+        self._sb_reasons = reasons
+        self.state.suffixes = suffixes
+        self.log.info("boot reasons b1=%s b2=%s", reasons[0], reasons[1])  # 理由コードだけ(SB-INV-6)
 
     def _on_progress(self, category: str, i: int, n: int, text: str) -> None:
         if self.state.cancel_requested:
@@ -297,12 +338,12 @@ class PcCheckupModule:
         st = self.state
         sections = [(c, st.results.get(c, []), st.ms.get(c)) for c in st.categories if st.results.get(c)]
         when = st.started or datetime.fromtimestamp(self._now()).astimezone()
-        return build(sections, when, self.secrets(), st.worse)
+        return build(sections, when, self.secrets(), st.worse, st.suffixes)
 
     # ================================================================ 開く操作(FR-10)
     def open_action(self, a: Action) -> bool:
         """action のボタン。開いてよいものだけ os.startfile で開く。category は診断を始める。"""
-        if a.kind == "category" and a.target in BY_CATEGORY:
+        if a.kind == "category" and a.target in RUNNABLE:
             return self.run([a.target])
         if a.kind == "uri" and a.target in ALLOWED_URIS:
             return self._open(a.target)
@@ -413,6 +454,24 @@ class PcCheckupModule:
         self.notifier.settings_changed.emit()
         return None
 
+    def set_secureboot_check(self, on: bool) -> str | None:
+        """設定 secureboot_check を保存する(B-9)。ボタン・「まとめて診断」・クイックアクションに効く。失敗したら理由の文を返す。"""
+        sec = dict(self.ctx.settings_dict())
+        sec.pop("enabled", None)
+        sec["secureboot_check"] = bool(on)
+        try:
+            self.ctx.write_settings(sec)
+        except Exception as e:  # noqa: BLE001 - 設定ファイルが壊れているときなど
+            return f"設定を保存できませんでした({type(e).__name__})"
+        self.secureboot_check = bool(on)
+        clear = getattr(self.ctx, "clear_quick_actions", None)
+        if clear is not None:  # クイックアクションを作り直す(SB-FR-7)
+            clear()
+            self._add_quick_actions()
+        self.log.info("secureboot_check=%s", self.secureboot_check)
+        self.notifier.settings_changed.emit()
+        return None
+
     # ================================================================ 状態表示・利用状況・診断
     def summary_text(self) -> str:
         st = self.state
@@ -442,6 +501,11 @@ class PcCheckupModule:
 
     def diagnostics(self) -> dict[str, str | int | bool]:
         out: dict[str, str | int | bool] = {"watch_disk": self.watch_disk, "running": self.state.running}
+        # SB-FR-8: 真偽と理由コードだけ(読んだ値そのものは入れない。SB-INV-6)
+        out["secureboot_check"] = self.secureboot_check
+        b1, b2 = self._sb_reasons or ("none", "none")
+        out["sb_b1"] = b1 if b1 in (*boot.B1_REASONS, "error") else "none"
+        out["sb_b2"] = b2 if b2 in (*boot.B2_REASONS, "error") else "none"
         st = self.state
         statuses: list[str]
         if st.done:
@@ -461,5 +525,5 @@ class PcCheckupModule:
         out["last_category"] = ",".join(cats)
         for s in STATUS_ORDER:
             out[f"last_{s}"] = sum(1 for x in statuses if x == s)
-        out["unknown_checks"] = ",".join(i for i in unknown_ids if i in ALL_IDS) or "none"
+        out["unknown_checks"] = ",".join(i for i in unknown_ids if i in HISTORY_IDS) or "none"
         return out

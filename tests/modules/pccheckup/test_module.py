@@ -22,7 +22,8 @@ def test_settings_defaults_written_back(make_module: Any) -> None:
     m, ctx, _ = make_module()
     assert m.watch_disk is False
     assert ctx.writes and ctx.writes[0]["watch_disk"] is False
-    m2, ctx2, _ = make_module(section={"watch_disk": True})
+    # v0.4: secureboot_check(既定 true)も補って書き戻す(追加仕様書 §10)。両方そろっていれば書かない
+    m2, ctx2, _ = make_module(section={"watch_disk": True, "secureboot_check": True})
     assert m2.watch_disk is True and not ctx2.writes
 
 
@@ -146,7 +147,8 @@ def test_open_action_allowlist(make_module: Any, tmp_path: Any) -> None:
 def test_quick_actions_open_page_and_run(make_module: Any) -> None:
     m, ctx, _ = make_module()
     labels = [q.label for q in ctx.quick]
-    assert labels == ["PC が重い原因を調べる", "ネットの不調を調べる", "容量を調べる"]
+    # v0.4: secureboot_check が true(既定)なら「起動の証明書を調べる」が4つ目に入る(SB-FR-7)
+    assert labels == ["PC が重い原因を調べる", "ネットの不調を調べる", "容量を調べる", "起動の証明書を調べる"]
     ctx.quick[1].callback()
     assert ctx.shown == 1 and m.state.categories == ["net"]
     assert ctx.quick[0].enabled() is True
@@ -165,7 +167,9 @@ def test_usage_counts(make_module: Any) -> None:
 def test_diagnostics(make_module: Any) -> None:
     m, _ctx, _ = make_module(FakeProbes(raise_on={"proxy"}, sysdrive=DiskInfo("C:\\", 100 * GiB, 1 * GiB)))
     d0 = m.diagnostics()
-    assert d0 == {"watch_disk": False, "running": False, "last_category": "none"}
+    # v0.4: secureboot_check と B1・B2 の理由コード(まだ調べていなければ none)が入る(SB-FR-8)
+    assert d0 == {"watch_disk": False, "running": False, "secureboot_check": True, "sb_b1": "none", "sb_b2": "none",
+                  "last_category": "none"}
     m.run(["perf", "net"])
     d = m.diagnostics()
     assert d["last_category"] == "perf,net"

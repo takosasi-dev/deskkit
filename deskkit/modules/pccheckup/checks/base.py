@@ -12,10 +12,12 @@ if TYPE_CHECKING:
     from deskkit.modules.pccheckup.probes import Probes
 
 Status = Literal["good", "warn", "bad", "info", "unknown"]
-Category = Literal["perf", "net", "storage"]
-CATEGORIES: tuple[Category, ...] = ("perf", "net", "storage")
-CATEGORY_LABELS: dict[str, str] = {"perf": "重い", "net": "ネット", "storage": "容量"}
-CATEGORY_TITLES: dict[str, str] = {"perf": "重い", "net": "ネットが遅い・つながらない", "storage": "容量が足りない"}
+Category = Literal["perf", "net", "storage", "boot"]
+# 履歴・利用状況で数えるカテゴリ。boot(起動の安全)は v0.4 の追加(追加仕様書 §3)
+CATEGORIES: tuple[Category, ...] = ("perf", "net", "storage", "boot")
+CATEGORY_LABELS: dict[str, str] = {"perf": "重い", "net": "ネット", "storage": "容量", "boot": "起動の安全"}
+CATEGORY_TITLES: dict[str, str] = {"perf": "重い", "net": "ネットが遅い・つながらない", "storage": "容量が足りない",
+                                   "boot": "起動の安全"}
 
 # FR-3: 画面の並び順(悪い順)。bad → warn → unknown → info → good
 STATUS_ORDER: dict[str, int] = {"bad": 0, "warn": 1, "unknown": 2, "info": 3, "good": 4}
@@ -34,7 +36,7 @@ class Action:
 
     text: str
     kind: ActionKind | None = None
-    target: str | None = None      # uri: ms-settings:... / folder: フォルダのパス / category: perf|net|storage
+    target: str | None = None      # uri: ms-settings:... / folder: フォルダのパス / category: perf|net|storage|boot
     button: str | None = None      # ボタンの文言
 
 

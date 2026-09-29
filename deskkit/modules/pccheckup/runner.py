@@ -8,17 +8,21 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from deskkit.modules.pccheckup.checks import net, perf, storage
+from deskkit.modules.pccheckup.checks import boot, net, perf, storage
 from deskkit.modules.pccheckup.checks.base import Cancel, Check, Finding, unknown
 from deskkit.modules.pccheckup.probes import Probes
 
+# 3つの大きなボタン(症状から選ぶカテゴリ)。起動の安全は小さなボタンと「まとめて診断」だけ(B-1)なので別に持つ
 BY_CATEGORY: dict[str, tuple[Check, ...]] = {"perf": perf.CHECKS, "net": net.CHECKS, "storage": storage.CHECKS}
+BOOT = "boot"
+RUNNABLE: dict[str, tuple[Check, ...]] = {**BY_CATEGORY, BOOT: boot.CHECKS}
 ALL_IDS: tuple[str, ...] = tuple(c.check_id for cs in BY_CATEGORY.values() for c in cs)
-TITLES: dict[str, str] = {**perf.TITLES, **net.TITLES, **storage.TITLES}
+HISTORY_IDS: tuple[str, ...] = ALL_IDS + boot.IDS   # 履歴に書いてよいチェック ID
+TITLES: dict[str, str] = {**perf.TITLES, **net.TITLES, **storage.TITLES, **boot.TITLES}
 
 
 def category_of(check_id: str) -> str:
-    return {"P": "perf", "N": "net", "S": "storage"}.get(check_id[:1], "")
+    return {"P": "perf", "N": "net", "S": "storage", "B": BOOT}.get(check_id[:1], "")
 
 
 @dataclass
@@ -46,7 +50,7 @@ def run_check(chk: Check, probes: Probes, cancel: Cancel, log: logging.Logger) -
 def run_category(category: str, probes: Probes, cancel: Cancel, log: logging.Logger, *,
                  on_progress: ProgressFn | None = None, on_finding: FindingFn | None = None,
                  clock: Callable[[], float] = time.monotonic) -> CategoryResult:
-    checks = BY_CATEGORY[category]
+    checks = RUNNABLE[category]
     res = CategoryResult(category)
     t0 = clock()
     for i, chk in enumerate(checks):

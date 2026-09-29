@@ -1,6 +1,7 @@
 # 通知の保留(H1)。前面がゲーム・全画面の間は error 以外の通知を出さずにためておき、前面が安全になったら
 # 「保留中の通知 N 件」を1件にまとめて出す(1件だけなら元の通知をそのまま出す)。前面の確認は保留中だけ 2 秒ごと。
 # 通知の記録(Control Center の「最近の通知」)は保留とは関係なくすぐに行う(host 側)。
+# (v0.4 H4-6)replace_key が同じ(送り主も同じ)通知が保留中にあれば、古い方を捨てて新しい方だけを残す。
 from __future__ import annotations
 
 import datetime as _dt
@@ -23,6 +24,7 @@ class Note:
     on_click: Callable[[], Any] | None
     level: str
     ts: _dt.datetime = field(default_factory=_dt.datetime.now)
+    replace_key: str | None = None
 
 
 class NotificationHold(QObject):
@@ -48,6 +50,10 @@ class NotificationHold(QObject):
     def offer(self, note: Note) -> bool:
         """保留したら True。False なら呼び出し側がすぐに出す(保留中のものがあれば先にまとめて出しておく)。"""
         if note.level != "error" and self._enabled() and self._busy():
+            if note.replace_key:
+                keep = [n for n in self._held if not (n.source == note.source and n.replace_key == note.replace_key)]
+                self._count -= len(self._held) - len(keep)
+                self._held = keep
             self._held.append(note)
             del self._held[:-MAX_HELD]
             self._count += 1
