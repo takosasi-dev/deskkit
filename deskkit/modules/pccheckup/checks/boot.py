@@ -153,18 +153,14 @@ def suffixes(raw: SecureBootRaw) -> dict[str, str]:
 
 
 # ------------------------------------------------------------------ 実行
-def today() -> date:
-    """PC の時計の今日(テストでは差し替える)。"""
-    return date.today()
-
-
+# 今日は Probes.today() から取る。本物の Probes はモジュールの時計(now)で作るので、モジュールの時計の日付になる(v0.4.1)。
 def _run_b1(p: Probes, _c: Cancel) -> Finding:
     return judge_b1(p.secure_boot())[0]
 
 
 def _run_b2(p: Probes, _c: Cancel) -> Finding:
     raw = p.secure_boot()
-    return judge_b2(raw, judge_b1(raw)[1], today())[0]
+    return judge_b2(raw, judge_b1(raw)[1], p.today())[0]
 
 
 PROGRESS = "起動の設定を読んでいます"

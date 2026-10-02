@@ -208,6 +208,38 @@ class Store:
     def add_snippet(self, name: str, text: str) -> Item:
         return self._insert(KIND_SNIPPET, text, None, name)
 
+    def add_snippets(self, pairs: list[tuple[str, str]]) -> list[Item]:
+        """定型文をまとめて足す(読み込み用)。先に全部を暗号化し、1 つのトランザクションで書く(全部入るか、何も入らないか)。
+        暗号化の失敗は CryptoError、DB の失敗は StoreError。"""
+        if not pairs:
+            return []
+        blobs = [encode_payload(self._cipher, Payload(text, None, name)) for name, text in pairs]
+        now = self._now()
+        iso = to_iso(now)
+        db = self._db()
+        ids: list[int] = []
+        try:
+            db.execute("BEGIN")
+            for blob in blobs:
+                cur = db.execute(
+                    "INSERT INTO items (kind, created_at, last_used_at, pinned, payload) VALUES (?, ?, ?, 0, ?)",
+                    (KIND_SNIPPET, iso, iso, blob),
+                )
+                ids.append(int(cur.lastrowid or 0))
+            db.execute("COMMIT")
+        except sqlite3.DatabaseError as e:
+            try:
+                db.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise StoreError(f"DB に書けません({type(e).__name__})") from None
+        out: list[Item] = []
+        for rid, (name, text) in zip(ids, pairs, strict=True):
+            item = Item(rid, KIND_SNIPPET, now, now, False, text, None, name)
+            self._items[item.id] = item
+            out.append(item)
+        return out
+
     def update_snippet(self, item_id: int, name: str, text: str) -> bool:
         item = self._items.get(item_id)
         if item is None or item.kind != KIND_SNIPPET:

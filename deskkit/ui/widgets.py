@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     QParallelAnimationGroup,
     QPoint,
     QPropertyAnimation,
+    QRect,
     QRectF,
     QSize,
     Qt,
@@ -30,6 +31,8 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
+    QLayout,
+    QLayoutItem,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -39,6 +42,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QVBoxLayout,
     QWidget,
+    QWidgetItem,
 )
 
 from deskkit.ui import theme as T
@@ -54,6 +58,52 @@ def label(text: str, role: str | None = None, *, wrap: bool = False) -> QLabel:
     if wrap:
         lb.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
     return lb
+
+
+class ElidedLabel(QLabel):
+    """1行の文。幅に入りきらないときは末尾を「…」にして、全文をツールチップに出す(文字の途中で切れて見えない)。
+    text() は画面に出ている文、full_text() は元の文。"""
+
+    def __init__(self, text: str = "", role: str | None = None) -> None:
+        super().__init__()
+        if role:
+            self.setObjectName(role)
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.set_full_text(text)
+
+    def full_text(self) -> str:
+        return self._full
+
+    def set_full_text(self, text: str) -> None:
+        self._full = text
+        self._apply()
+        self.updateGeometry()
+
+    def _apply(self) -> None:
+        avail = max(0, self.contentsRect().width())
+        shown = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, avail) if avail > 0 else self._full
+        if shown != self.text():
+            super().setText(shown)
+        self.setToolTip(self._full if shown != self._full else "")
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        m = self.contentsMargins()
+        fm = self.fontMetrics()
+        return QSize(fm.horizontalAdvance(self._full) + m.left() + m.right() + 2, fm.height() + m.top() + m.bottom())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        m = self.contentsMargins()
+        return QSize(0, self.fontMetrics().height() + m.top() + m.bottom())
+
+    def resizeEvent(self, e: Any) -> None:  # noqa: N802
+        super().resizeEvent(e)
+        self._apply()
+
+    def changeEvent(self, e: Any) -> None:  # noqa: N802
+        super().changeEvent(e)
+        if e.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange):
+            self._apply()
 
 
 def divider() -> QFrame:
@@ -221,16 +271,24 @@ _PILL_COLORS = {"ok": T.SUCCESS, "warn": T.WARN, "error": T.DANGER, "info": T.IN
 
 
 class StatusPill(QLabel):
-    def __init__(self, text: str = "", kind: str = "off") -> None:
+    """状態のピル。compact=True は小さい版(ホームのモジュールカードの名前の横に置く。v0.4.1)。"""
+
+    def __init__(self, text: str = "", kind: str = "off", *, compact: bool = False) -> None:
         super().__init__()
+        self._compact = compact
         self.set_state(kind, text)
 
     def set_state(self, kind: str, text: str) -> None:
         c = _PILL_COLORS.get(kind, kind if kind.startswith("#") else T.TEXT_MUTE)
-        self.setText(f"●  {text}")
+        if self._compact:
+            self.setText(f"● {text}")
+            size = "border-radius: 9px; padding: 1px 7px; font-size: 11px;"
+        else:
+            self.setText(f"●  {text}")
+            size = "border-radius: 11px; padding: 3px 10px; font-size: 12px;"
         self.setStyleSheet(
             f"QLabel {{ color: {c}; background: {T.alpha(c, 0.12)}; border: 1px solid {T.alpha(c, 0.30)};"
-            f" border-radius: 11px; padding: 3px 10px; font-size: 12px; font-weight: 600; }}"
+            f" {size} font-weight: 600; }}"
         )
 
 
@@ -293,6 +351,77 @@ class Card(QFrame):
         super().leaveEvent(e)
 
 
+class FlowLayout(QLayout):
+    """左から並べ、幅が足りなければ次の行へ折り返す(v0.4.1。見出しの状態ピルが窓を横にはみ出さないように)。
+    隠れている部品は詰める。望ましい大きさは 1 行に並べたときの幅。"""
+
+    def __init__(self, spacing: int = 8) -> None:
+        super().__init__()
+        self._items: list[QLayoutItem] = []
+        self._gap = spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item: QLayoutItem) -> None:  # noqa: N802
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, i: int) -> QLayoutItem | None:  # noqa: N802
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i: int) -> QLayoutItem | None:  # noqa: N802
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self) -> Qt.Orientation:  # noqa: N802
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._arrange(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect: QRect) -> None:  # noqa: N802
+        super().setGeometry(rect)
+        self._arrange(rect, apply=True)
+
+    def _visible(self) -> list[QLayoutItem]:
+        return [it for it in self._items if not it.isEmpty()]
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        vis = self._visible()
+        if not vis:
+            return QSize(0, 0)
+        w = sum(it.sizeHint().width() for it in vis) + self._gap * (len(vis) - 1)
+        h = max(it.sizeHint().height() for it in vis)
+        m = self.contentsMargins()
+        return QSize(w + m.left() + m.right(), h + m.top() + m.bottom())
+
+    def minimumSize(self) -> QSize:  # noqa: N802
+        s = QSize(0, 0)
+        for it in self._visible():
+            s = s.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return s + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _arrange(self, rect: QRect, *, apply: bool) -> int:
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = eff.x(), eff.y(), 0
+        for it in self._visible():
+            hint = it.sizeHint()
+            if line_h > 0 and x + hint.width() > eff.x() + eff.width():
+                x = eff.x()
+                y += line_h + self._gap
+                line_h = 0
+            if apply:
+                it.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._gap
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y() + m.bottom() if line_h else 0
+
+
 class Hero(QFrame):
     """モジュール画面の先頭に置く、アクセント色のグラデーション見出し。"""
 
@@ -313,9 +442,7 @@ class Hero(QFrame):
         tb.addWidget(self.title_label)
         self.tag = label(tagline, "Dim", wrap=True)
         tb.addWidget(self.tag)
-        self.pills = QHBoxLayout()
-        self.pills.setSpacing(8)
-        self.pills.addStretch(1)
+        self.pills = FlowLayout(8)  # 幅が足りなければ折り返す(窓を横にはみ出さない)
         tb.addLayout(self.pills)
         lay.addLayout(tb, 1)
         self.right = QVBoxLayout()
@@ -327,7 +454,7 @@ class Hero(QFrame):
         self.title_label.setText(title)
 
     def add_pill(self, pill: QWidget) -> None:
-        self.pills.insertWidget(self.pills.count() - 1, pill)
+        self.pills.addWidget(pill)
 
     def add_action(self, w: QWidget) -> None:
         self.right.addWidget(w)
@@ -593,7 +720,41 @@ class HotkeyEdit(QLineEdit):
 
 # ------------------------------------------------------------------ フェード切替スタック
 class FadeStack(QStackedWidget):
-    """ページ切替時に、新しいページを少し下からフェードインさせる。"""
+    """ページ切替時に、新しいページを少し下からフェードインさせる。
+
+    (v0.4.1)大きさの目安は今表示しているページだけから決める。QStackedWidget のままだと隠れているページの高さまで
+    最小の高さに入るので、高さの違うページを切り替えると短いページのカードが縦に伸びていた(docs/v0.4/pagepress.md §6)。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _i: self.updateGeometry())
+
+    def _current_item(self) -> QWidgetItem | None:
+        w = self.currentWidget()
+        return QWidgetItem(w) if w is not None else None  # 大きさの方針・明示の最小/最大をレイアウトと同じ規則で扱う
+
+    def _frame_extra(self) -> QSize:
+        m = self.contentsMargins()
+        return QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        it = self._current_item()
+        return (it.sizeHint() if it is not None else QSize(0, 0)) + self._frame_extra()
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        it = self._current_item()
+        return (it.minimumSize() if it is not None else QSize(0, 0)) + self._frame_extra()
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        it = self._current_item()
+        return bool(it is not None and it.hasHeightForWidth())
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        it = self._current_item()
+        if it is None or not it.hasHeightForWidth():
+            return -1
+        ex = self._frame_extra()
+        return int(it.heightForWidth(width - ex.width())) + ex.height()
 
     def switch_to(self, w: QWidget) -> None:
         if self.currentWidget() is w:

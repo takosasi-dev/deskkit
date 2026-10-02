@@ -337,3 +337,19 @@ class Scanner:
         if res is not None and not res.running and c in res.cells:
             res.cells[c] = Cell(USED)
             self._on_change()
+
+    def mark_holder(self, c: Combo, holder: str) -> None:
+        """(v0.4.1)DeskKit がこの組を holder の名前で持つようになった。前に同じ名前で持っていた組は「まだ調べていない」に戻す
+        (手放した組が空いたかは、調べ直すまで分からない)。"""
+        res = self.result
+        if res is None or res.running:
+            return
+        for old, name in list(res.held_names.items()):
+            if name == holder and old != c:
+                del res.held_names[old]
+                if old in res.cells:
+                    res.cells[old] = Cell(PENDING)
+        if c in res.cells:
+            res.cells[c] = Cell(DESKKIT)
+            res.held_names[c] = holder
+        self._on_change()

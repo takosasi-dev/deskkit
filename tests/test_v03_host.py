@@ -377,13 +377,13 @@ def test_theme_has_colors_for_all_modules() -> None:
     assert len({m.accent for m in catalog.MODULES}) == len(catalog.MODULE_NAMES)
 
 
-def test_version_is_040() -> None:  # v0.4.0 で版を上げた(H4-12)
+def test_version_is_041() -> None:  # v0.4.0 で版を上げた(H4-12)。v0.4.1 で小さな直し
     import deskkit
 
-    assert deskkit.__version__ == "0.4.0"
-    assert 'version = "0.4.0"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert deskkit.__version__ == "0.4.1"
+    assert 'version = "0.4.1"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert "## [0.4.0] - " in changelog and "## [0.3.0] - 2026-09-25" in changelog
+    assert "## [0.4.1] - " in changelog and "## [0.4.0] - 2026-09-29" in changelog
 
 
 # ---------------------------------------------------------------- 例外のログに本文・パスを書かない(v0.3 VINV-4)

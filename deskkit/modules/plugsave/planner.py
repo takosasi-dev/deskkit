@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import datetime as _dt
+import heapq
+import itertools
 import os
 import stat as _stat
 import threading
@@ -75,20 +77,27 @@ class Source:
     name: str
 
 
+NEW = "new"
+CHANGED = "changed"
+VERIFY = "verify"        # 大きさ・更新日時は同じだが、止まった回に書いた小さいファイル(中身を比べ、違えばもう一度コピー。v0.4.1)
+
+
 @dataclass(frozen=True)
 class PlanItem:
-    kind: str            # "new" / "changed"
+    kind: str            # "new" / "changed" / "verify"
     src: str             # コピー元(\\?\ 付き)
     rel: str             # コピー元の中の相対パス
     source_name: str     # 先のフォルダ名(FR-3)
     size: int
     mtime_ns: int
     atime_ns: int
+    birth_ns: int = 0    # 確かめる物だけ: 先のファイルの作成日時(確かめる順・確かめ終えたところに使う)
 
 
 @dataclass
 class Plan:
-    items: list[PlanItem] = field(default_factory=list)
+    items: list[PlanItem] = field(default_factory=list)      # コピーする物(新しい・変わった)。上限 max_files
+    verify: list[PlanItem] = field(default_factory=list)     # 確かめる物(作成日時の古い順)。上限 max_verify(別に数える)
     unchanged: int = 0
     reasons: dict[str, int] = field(default_factory=dict)
     rows: list[tuple[str, str]] = field(default_factory=list)   # (画面用のパス, 理由コード)
@@ -97,18 +106,32 @@ class Plan:
     total_sources: int = 0
     seen: int = 0
     cancelled: bool = False
+    verify_truncated: bool = False   # 確かめる物が上限を超えた(作成日時の古い方から上限まで取った)
+    verify_from: int = 0             # verify_truncated のとき、取らなかった物の中で最も古い作成日時
+    unreadable_dirs: int = 0         # 途中で読めなかったフォルダ(コピー元・先)
+    suspect_skipped: int = 0         # 確かめるべきだが確かめられない物(コピー元がクラウドにだけある)
 
     @property
     def new_count(self) -> int:
-        return sum(1 for i in self.items if i.kind == "new")
+        return sum(1 for i in self.items if i.kind == NEW)
 
     @property
     def changed_count(self) -> int:
-        return sum(1 for i in self.items if i.kind == "changed")
+        return sum(1 for i in self.items if i.kind == CHANGED)
+
+    @property
+    def verify_count(self) -> int:
+        return len(self.verify)
 
     @property
     def copy_bytes(self) -> int:
+        """コピーする大きさ(確かめるだけの物は数えない。中身が違ってコピーし直す分はコピー中の空きの確認で見る)。"""
         return sum(i.size for i in self.items)
+
+    @property
+    def scan_complete(self) -> bool:
+        """コピー元を全部たどれた(止めていない・切り詰めていない・見つからない/読めない所が無い・確かめられない物が無い)。"""
+        return not (self.cancelled or self.truncated or self.missing_sources or self.unreadable_dirs or self.suspect_skipped)
 
     def skip(self, path: str, reason: str) -> None:
         self.reasons[reason] = self.reasons.get(reason, 0) + 1
@@ -160,12 +183,22 @@ def is_excluded_name(name: str) -> bool:
     return name.startswith("~$") or name.lower() in EXCLUDED_NAMES
 
 
-def _dest_listing(path: str) -> dict[str, tuple[bool, int, int]]:
-    """先のフォルダの中身: 名前(normcase)→(フォルダか, 大きさ, 更新日時 ns)。無い・読めないときは空。"""
-    out: dict[str, tuple[bool, int, int]] = {}
+def _birth(st: os.stat_result) -> int:
+    v = getattr(st, "st_birthtime_ns", None)
+    return int(v) if isinstance(v, int) and v > 0 else 0
+
+
+def _dest_listing(path: str, plan: Plan | None = None) -> dict[str, tuple[bool, int, int, int]]:
+    """先のフォルダの中身: 名前(normcase)→(フォルダか, 大きさ, 更新日時 ns, 作成日時 ns(読めなければ 0))。無い・読めないときは空。
+    無い(まだコピーしていない)以外の理由で読めなければ plan.unreadable_dirs を数える。"""
+    out: dict[str, tuple[bool, int, int, int]] = {}
     try:
         it = os.scandir(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return out
     except OSError:
+        if plan is not None:
+            plan.unreadable_dirs += 1
         return out
     with it:
         for e in it:
@@ -175,7 +208,7 @@ def _dest_listing(path: str) -> dict[str, tuple[bool, int, int]]:
                 continue
             attrs = int(getattr(st, "st_file_attributes", 0))
             is_dir = _stat.S_ISDIR(st.st_mode) or bool(attrs & FILE_ATTRIBUTE_DIRECTORY)
-            out[os.path.normcase(e.name)] = (is_dir, int(st.st_size), int(st.st_mtime_ns))
+            out[os.path.normcase(e.name)] = (is_dir, int(st.st_size), int(st.st_mtime_ns), _birth(st))
     return out
 
 
@@ -192,15 +225,38 @@ def same_file(src_size: int, src_mtime: int, dst_size: int, dst_mtime: int, fs: 
 
 def make_plan(sources: Sequence[Source], pc_dir: str, fs: str, *, excluded: Sequence[str] = (),
               cancel: threading.Event | None = None, on_count: Callable[[int], None] | None = None,
-              max_files: int = MAX_PLAN_FILES) -> Plan:
+              max_files: int = MAX_PLAN_FILES, suspect: Callable[[int, int], bool] | None = None,
+              max_verify: int = MAX_PLAN_FILES) -> Plan:
     """計画を作る。pc_dir は `<根>\\DeskKitバックアップ\\<PC の名前>`(\\?\\ 付き)。fs は先のファイルシステム名。
-    max_files はコピーが要るファイル(新しい・変わった)の数の上限で、超えたらそこで切る(FR-15。docs/v0.4/plugsave.md S-3)。"""
+    max_files はコピーが要るファイル(新しい・変わった)の数の上限で、超えたらそこで切る(FR-15。docs/v0.4/plugsave.md S-3)。
+    suspect(大きさ, 先の作成日時 ns)が真の「そのまま」は「確かめる」にする(前の回が途中で止まったとき。unfinished.py)。
+    確かめる物は max_files に数えず、別に max_verify まで、先の作成日時の古い順に取る(超えた分は次の回。verify_from)。"""
     plan = Plan(total_sources=len(sources))
+    heap: list[tuple[int, int, PlanItem]] = []    # (-作成日時, 通し番号, 項目): 作成日時の新しい物を捨てる
+    try:
+        _scan(plan, heap, sources, pc_dir, fs, excluded, cancel, on_count, max_files, suspect, max_verify)
+    finally:
+        plan.verify = sorted((x[2] for x in heap), key=lambda i: i.birth_ns)
+    return plan
+
+
+def _scan(plan: Plan, heap: list[tuple[int, int, PlanItem]], sources: Sequence[Source], pc_dir: str, fs: str,
+          excluded: Sequence[str], cancel: threading.Event | None, on_count: Callable[[int], None] | None, max_files: int,
+          suspect: Callable[[int, int], bool] | None, max_verify: int) -> None:
     fat32 = drives.is_fat32(fs)
+    seq = itertools.count()
+
+    def add_verify(item: PlanItem) -> None:
+        heapq.heappush(heap, (-item.birth_ns, next(seq), item))
+        if len(heap) > max(0, max_verify):
+            dropped = heapq.heappop(heap)[2]
+            plan.verify_truncated = True
+            plan.verify_from = dropped.birth_ns if not plan.verify_from else min(plan.verify_from, dropped.birth_ns)
+
     for src in sources:
         if cancel is not None and cancel.is_set():
             plan.cancelled = True
-            return plan
+            return
         root = drives.long_path(src.path)
         if not os.path.isdir(root) or any(inside(norm(root), x) for x in excluded):
             plan.missing_sources += 1
@@ -212,17 +268,19 @@ def make_plan(sources: Sequence[Source], pc_dir: str, fs: str, *, excluded: Sequ
         while stack:
             if cancel is not None and cancel.is_set():
                 plan.cancelled = True
-                return plan
+                return
             d, rel_d = stack.pop()
             try:
                 it = scan_source(d)
             except OSError:
                 if first:
                     plan.missing_sources += 1
+                else:
+                    plan.unreadable_dirs += 1
                 first = False
                 continue
             first = False
-            dest_now = _dest_listing(os.path.join(dest_base, rel_d) if rel_d else dest_base)
+            dest_now = _dest_listing(os.path.join(dest_base, rel_d) if rel_d else dest_base, plan)
             subdirs: list[tuple[str, str]] = []
             with it:
                 for e in it:
@@ -251,6 +309,9 @@ def make_plan(sources: Sequence[Source], pc_dir: str, fs: str, *, excluded: Sequ
                         continue
                     if attrs & CLOUD_ONLY_ATTRS:
                         plan.skip(e.path, R_CLOUD_ONLY)   # 開かない(AC-6)
+                        was = dest_now.get(os.path.normcase(e.name))
+                        if suspect is not None and was is not None and not was[0] and suspect(was[1], was[3]):
+                            plan.suspect_skipped += 1     # 先にある物を確かめられない(印を残す)
                         continue
                     size = int(st.st_size)
                     if fat32 and size >= FAT32_LIMIT:
@@ -264,17 +325,19 @@ def make_plan(sources: Sequence[Source], pc_dir: str, fs: str, *, excluded: Sequ
                     mtime = int(st.st_mtime_ns)
                     got = dest_now.get(os.path.normcase(e.name))
                     if got is not None and not got[0] and same_file(size, mtime, got[1], got[2], fs):
-                        plan.unchanged += 1
+                        if suspect is None or not suspect(got[1], got[3]):
+                            plan.unchanged += 1
+                        else:
+                            add_verify(PlanItem(VERIFY, e.path, rel, src.name, size, mtime, int(st.st_atime_ns), got[3]))
                         continue
                     if len(plan.items) >= max_files:
                         plan.truncated = True
-                        return plan
-                    kind = "new" if got is None else "changed"
+                        return
+                    kind = NEW if got is None else CHANGED
                     plan.items.append(PlanItem(kind, e.path, rel, src.name, size, mtime, int(st.st_atime_ns)))
             stack.extend(reversed(sorted(subdirs)))
     if on_count is not None:
         on_count(plan.seen)
-    return plan
 
 
 def fit_to_space(items: Sequence[PlanItem], budget: int) -> tuple[list[PlanItem], int]:

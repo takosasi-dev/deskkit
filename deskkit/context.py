@@ -164,6 +164,12 @@ class ModuleContextImpl:
         if restart:
             QTimer.singleShot(0, lambda: self._host.loader.restart(self.name))
 
+    def set_quick_action_hotkey(self, text: str, *, revert_on_fail: bool = False) -> bool:
+        """(v0.4.1)DeskKit のクイックアクションのキーを変える('Ctrl+Alt+K' の形。空なら使わない)。
+        メインスレッドから呼ぶ。登録できたら True。取れなかった組は、既定では保存して競合として知らせ、
+        revert_on_fail なら前のキーに戻す。構文エラーの settings.json は上書きせず SettingsError。"""
+        return self._host.set_quick_action_hotkey(text, revert_on_fail=revert_on_fail)
+
     def game_processes(self) -> frozenset[str]:
         return self._host.settings.game_processes()
 

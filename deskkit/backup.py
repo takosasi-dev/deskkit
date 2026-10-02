@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from deskkit import __version__
+from deskkit import __version__, catalog
 from deskkit.settings import SettingsError, SettingsStore
 
 MAGIC = "deskkit-settings-backup"
@@ -39,14 +39,15 @@ def read(src: Path) -> dict[str, Any]:
 
 
 def summary(settings: dict[str, Any]) -> list[str]:
+    """画面に出す要約。モジュールは内部名ではなく表示名(ModeShift など)で書く(v0.4.1)。"""
     mods = settings.get("modules", {})
-    on = [n for n, s in mods.items() if isinstance(s, dict) and s.get("enabled")]
+    on = [catalog.info(n).title for n, s in mods.items() if isinstance(s, dict) and s.get("enabled")]
     lines = [f"有効なモジュール: {', '.join(on) if on else 'なし'}",
              f"ゲームとして扱うアプリ: {len(settings.get('game_processes', []))} 件"]
     for name, key, unit in (("dropsort", "rules", "ルール"), ("modeshift", "modes", "モード"), ("layoutkeep", "targets", "対象")):
         sec = mods.get(name, {})
         if isinstance(sec, dict) and isinstance(sec.get(key), list):
-            lines.append(f"{name}: {len(sec[key])} {unit}")
+            lines.append(f"{catalog.info(name).title}: {len(sec[key])} {unit}")
     return lines
 
 

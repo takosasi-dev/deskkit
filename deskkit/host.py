@@ -54,6 +54,7 @@ class HostSignals(QObject):
     settings_replaced = Signal()  # 設定をファイルから読み直した(再読み込み・世代の復元・バックアップの読み込み)
     snapshot_request = Signal()  # settings.json が書かれた(どのスレッドからでも emit してよい)
     snapshots_changed = Signal()  # 設定の世代が増えた・減った
+    quick_hotkey_changed = Signal(str)  # (v0.4.1)クイックアクションのキーが変わった(設定画面の表示を合わせる)
 
 
 class Host:
@@ -150,6 +151,24 @@ class Host:
         self.hotkeys.add_callback("host.quick", self._quick_hotkey)
         self.tray.set_quick_hotkey(self.hotkeys.combo_text("host.quick"))
 
+    def set_quick_action_hotkey(self, text: str, *, revert_on_fail: bool = False) -> bool:
+        """(v0.4.1)クイックアクションのキーを保存して登録し直す。設定画面と KeyFree の両方から使う。
+        登録できた(または空にした)なら True。取れなかった組は、既定では保存して FR-9 の一括通知に載せる(設定画面で手で入れたとき)。
+        revert_on_fail なら前のキーに戻す(KeyFree から選んだとき。使えていたキーを失わない)。
+        構文エラーの settings.json は上書きせず SettingsError。"""
+        old = str(self.settings.host().get("quick_action_hotkey") or "")
+        self.settings.write_host({"quick_action_hotkey": text})
+        self.register_host_hotkeys()
+        ok = not text or "host.quick" in self.hotkeys.combos
+        if not ok and revert_on_fail:
+            self.hotkeys.conflicts[:] = [c for c in self.hotkeys.conflicts if c[0] != "host.quick"]
+            self.settings.write_host({"quick_action_hotkey": old})
+            self.register_host_hotkeys()
+            text = old
+        self.after_hotkey_registration()
+        self.signals.quick_hotkey_changed.emit(text)
+        return ok
+
     def _quick_hotkey(self) -> None:
         try:
             from deskkit.foreground import query_foreground
@@ -175,12 +194,25 @@ class Host:
         self.show_window()
         Onboarding(self, self._window).exec()
 
+    def _conflict_text(self) -> str:
+        """(v0.4.1)通知の本文は表示名で書く(「ClipShelf パレットを開く(Ctrl+Alt+V)」の形。ログは登録名のまま)。"""
+        from deskkit.context import list_modes
+        from deskkit.hotkeys import hotkey_label
+
+        modes = dict(list_modes(self.settings.module_section("modeshift")))
+        out: list[str] = []
+        for full, key in self.hotkeys.conflicts:
+            mod = full.partition(".")[0]
+            owner = "DeskKit" if mod == "host" else (catalog.info(mod).title if mod in catalog.MODULE_NAMES else mod)
+            out.append(f"{owner} {hotkey_label(full, modes)}({key})")
+        return "、".join(out)
+
     def after_hotkey_registration(self) -> None:
         """起動・再読み込み直後に、ホットキー競合をまとめて1回だけ通知する(FR-9)。"""
         if self.hotkeys.conflicts:
             items = ", ".join(f"{n}({k})" for n, k in self.hotkeys.conflicts)
             log.warning("ホットキー登録失敗: %s", items)
-            self.notify("host", "登録できなかったホットキーがあります", items, self.show_window, level="warn")
+            self.notify("host", "登録できなかったホットキーがあります", self._conflict_text(), self.show_window, level="warn")
             self.hotkeys.conflicts.clear()
 
     # ---- 通知
@@ -413,7 +445,8 @@ class Host:
 
                 self.notify("host", f"{title} が無効なので、ファイルを受け取れませんでした",
                             f"Control Center で {title} を有効にしてから、もう一度送ってください", open_page, level="warn")
-            return 11, f"{name} は無効または停止中です"
+            shown = catalog.info(name).title if name in catalog.MODULE_NAMES else name
+            return 11, f"{shown} は無効または停止中です"
         ctx = self.loader.slots[name].ctx
         assert ctx is not None
         result = ctx.safe(mod.handle_cli, "handle_cli")(list(args[1:]))

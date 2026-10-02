@@ -534,3 +534,42 @@ def test_window_fits_low_screens_with_15_modules(host: Any, qapp: Any) -> None:
     assert w.minimumSizeHint().height() <= 660  # 1366×768 の作業領域に収まる(setMinimumSize と同じ高さまで)
     assert w.side_scroll.widget() is w.sidebar and len(w.sidebar.items) == len(MODULE_NAMES) + 4
     w.hide()
+
+
+# ------------------------------------------------------------------ v0.4.1 ctx.set_quick_action_hotkey(KeyFree から変える)
+def test_ctx_set_quick_action_hotkey(host: Any, qapp: Any) -> None:
+    ctx = _ctx(host)
+    host.show_window("settings")
+    _pump(qapp)
+    page = host._window.settings_page
+    seen: list[str] = []
+    host.signals.quick_hotkey_changed.connect(seen.append)
+    assert "host.quick" in host.hotkeys.failed  # fixture では Ctrl+Alt+Space がほかのアプリに取られている
+    assert ctx.set_quick_action_hotkey("Ctrl+Alt+Shift+K") is True
+    assert host.settings.host()["quick_action_hotkey"] == "Ctrl+Alt+Shift+K"
+    assert host.hotkeys.combos["host.quick"] == (MOD_CONTROL | MOD_ALT | MOD_SHIFT, 0x4B)
+    assert "host.quick" not in host.hotkeys.failed
+    assert seen == ["Ctrl+Alt+Shift+K"] and page.qa_key.text() == "Ctrl+Alt+Shift+K"
+    # 取られている組: 保存はするが False、競合として知らせる
+    assert ctx.set_quick_action_hotkey("Ctrl+Alt+Space") is False
+    assert host.settings.host()["quick_action_hotkey"] == "Ctrl+Alt+Space" and "host.quick" in host.hotkeys.failed
+    # 競合の通知の本文は表示名(v0.4.1)
+    sent: list[tuple[str, str]] = []
+    orig = host.notify
+    host.notify = lambda src, title, text, *a, **k: (sent.append((title, text)), orig(src, title, text, *a, **k))
+    ctx.set_quick_action_hotkey("Ctrl+Alt+Space")
+    host.notify = orig
+    assert ("登録できなかったホットキーがあります", "DeskKit クイックアクション(Ctrl+Alt+Space)") in sent
+    # KeyFree から選んだとき(revert_on_fail)は、取れなければ前のキーに戻す(v0.4.1 レビュー 6)
+    assert ctx.set_quick_action_hotkey("Ctrl+Alt+Shift+K") is True
+    sent.clear()
+    host.notify = lambda src, title, text, *a, **k: (sent.append((title, text)), orig(src, title, text, *a, **k))
+    assert ctx.set_quick_action_hotkey("Ctrl+Alt+Space", revert_on_fail=True) is False
+    host.notify = orig
+    assert host.settings.host()["quick_action_hotkey"] == "Ctrl+Alt+Shift+K"
+    assert host.hotkeys.combos["host.quick"] == (MOD_CONTROL | MOD_ALT | MOD_SHIFT, 0x4B)
+    assert "host.quick" not in host.hotkeys.failed and sent == [] and page.qa_key.text() == "Ctrl+Alt+Shift+K"
+    # 空にすると使わない(成功扱い)
+    assert ctx.set_quick_action_hotkey("") is True
+    assert "host.quick" not in host.hotkeys.combos and page.qa_key.text() == ""
+    host._window.hide()

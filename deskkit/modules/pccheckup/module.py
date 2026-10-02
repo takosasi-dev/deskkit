@@ -279,7 +279,7 @@ class PcCheckupModule:
             raw = probes.secure_boot()
         except Exception:  # noqa: BLE001 - 理由コードが取れないだけで、結果はもう出ている
             return ("error", "error"), {}
-        return boot.reasons(raw, boot.today()), boot.suffixes(raw)
+        return boot.reasons(raw, probes.today()), boot.suffixes(raw)  # B2 のチェックと同じ今日(モジュールの時計)
 
     def _on_boot_read(self, reasons: tuple[str, str], suffixes: dict[str, str]) -> None:
         self._sb_reasons = reasons

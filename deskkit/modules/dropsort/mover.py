@@ -113,7 +113,7 @@ class Mover:
                 if motw.present and motw.raw is not None:
                     after = self._api.read_zone_identifier(cand)
                     if after.data != motw.raw:
-                        self._log.warning("移動後の Zone.Identifier が一致しません: %s", cand)
+                        self._log.warning("移動後の Zone.Identifier が一致しません(1 件)")
                 return Outcome("moved", cand, None, p.dst_fs)
             if err in W.EXISTS_ERRORS:
                 continue  # 探索中に別プロセスが同名を作った → 次の番号(上書きしない)
@@ -176,5 +176,5 @@ class Mover:
                 return cand
             if err not in W.EXISTS_ERRORS:
                 break
-        self._log.warning("検証に失敗したコピーを %s へ移せませんでした。移動先に残しています: %s", FAILED_DIR, copied)
+        self._log.warning("検証に失敗したコピーを %s へ移せませんでした。移動先に残しています(1 件)", FAILED_DIR)
         return copied

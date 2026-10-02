@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -50,6 +51,7 @@ from deskkit.ui.theme import G
 from deskkit.ui.usage_page import UsagePage
 from deskkit.ui.widgets import (
     Card,
+    ElidedLabel,
     FadeStack,
     Glyph,
     Hero,
@@ -64,6 +66,7 @@ from deskkit.ui.widgets import (
     button,
     confirm,
     dark_titlebar,
+    icon_button,
     label,
     message,
 )
@@ -77,6 +80,10 @@ STATE_TEXT = {"running": ("ok", "動作中"), "stopped": ("error", "停止中"),
 
 
 # ================================================================== サイドバー
+# v0.4.1: 窓の高さ 800px(既定)で見出しから「ログ」までスクロールなしで収まるよう、1行を 40→32px に詰めた。
+NAV_ITEM_HEIGHT = 32
+
+
 class NavItem(QAbstractButton):
     def __init__(self, key: str, text: str, glyph: str, accent: str) -> None:
         super().__init__()
@@ -87,7 +94,7 @@ class NavItem(QAbstractButton):
         self._dot: str | None = None
         self._hover = 0.0
         self.setCheckable(True)
-        self.setFixedHeight(40)
+        self.setFixedHeight(NAV_ITEM_HEIGHT)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._anim = QPropertyAnimation(self, b"hover", self)
         self._anim.setDuration(140)
@@ -118,7 +125,7 @@ class NavItem(QAbstractButton):
         super().leaveEvent(e)
 
     def sizeHint(self) -> QSize:
-        return QSize(200, 40)
+        return QSize(200, NAV_ITEM_HEIGHT)
 
     def paintEvent(self, _e: Any) -> None:  # noqa: N802
         p = QPainter(self)
@@ -128,7 +135,7 @@ class NavItem(QAbstractButton):
             c = QColor(T.SURFACE2)
             c.setAlphaF(self._hover)
             path = QPainterPath()
-            path.addRoundedRect(r, 9, 9)
+            path.addRoundedRect(r, 8, 8)
             p.fillPath(path, c)
         on = self.isChecked()
         p.setFont(T.icon_font(15))
@@ -161,12 +168,13 @@ class Indicator(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(self.rect()).adjusted(8, 2, -8, -2)
         path = QPainterPath()
-        path.addRoundedRect(r, 9, 9)
+        path.addRoundedRect(r, 8, 8)
         bg = QColor(self._color)
         bg.setAlpha(34)
         p.fillPath(path, bg)
         bar = QPainterPath()
-        bar.addRoundedRect(QRectF(r.left(), r.top() + 10, 3, r.height() - 20), 1.5, 1.5)
+        inset = max(4.0, r.height() * 0.25)
+        bar.addRoundedRect(QRectF(r.left(), r.top() + inset, 3, r.height() - 2 * inset), 1.5, 1.5)
         p.fillPath(bar, self._color)
 
 
@@ -181,12 +189,12 @@ class Sidebar(QFrame):
         self.setObjectName("SidebarRoot")
         self._on_select = on_select
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 18, 0, 14)
-        lay.setSpacing(2)
+        lay.setContentsMargins(0, 14, 0, 10)
+        lay.setSpacing(1)
         brand = QHBoxLayout()
-        brand.setContentsMargins(20, 0, 16, 14)
+        brand.setContentsMargins(20, 0, 16, 8)
         logo = QLabel()
-        logo.setPixmap(icons.render(34 * 2).scaled(34, 34, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        logo.setPixmap(icons.render(32 * 2).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         brand.addWidget(logo)
         bt = QVBoxLayout()
         bt.setSpacing(0)
@@ -202,15 +210,16 @@ class Sidebar(QFrame):
         self.items: dict[str, NavItem] = {}
         self._add(lay, "home", "ホーム", G.HOME, T.ACCENT)
         self._add(lay, "usage", "利用状況", G.LIST, T.ACCENT)
-        lay.addSpacing(10)
+        lay.addSpacing(4)
         eb = label("モジュール", "Eyebrow")
-        eb.setContentsMargins(22, 4, 0, 4)
+        eb.setContentsMargins(22, 2, 0, 2)
         lay.addWidget(eb)
         for m in catalog.MODULES:
             self._add(lay, m.name, m.title, m.glyph, m.accent)
         lay.addStretch(1)
+        lay.addSpacing(4)
         eb2 = label("システム", "Eyebrow")
-        eb2.setContentsMargins(22, 4, 0, 4)
+        eb2.setContentsMargins(22, 2, 0, 2)
         lay.addWidget(eb2)
         self._add(lay, "settings", "設定", G.SETTINGS, T.ACCENT)
         self._add(lay, "logs", "ログ", G.LOG, T.ACCENT)
@@ -279,41 +288,57 @@ class _Clickable(QFrame):
 
 
 class ModuleCard(Card):
+    """ホームのモジュールカード。v0.4.1 で 2 段に詰めた(約 176px → 100px 前後)。
+    1段目: アイコン・名前と状態(小さいピル)とスイッチ、その下に一言(右端まで使う。入りきらなければ 2 行に折り返す)。
+    2段目: 状態文(1行。入りきらなければ「…」にして全文をツールチップに)・再起動(停止中だけ)・開く。"""
+
     def __init__(self, host: Host, name: str, open_page: Any) -> None:
         info = catalog.info(name)
-        super().__init__(hover=True, padding=18)
+        super().__init__(hover=True, padding=14)
         self._host = host
         self.name = name
         self._open_page = open_page
         self._pressed = False
-        self.setMinimumHeight(176)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(f"クリックで {info.title} の画面を開く")
+        self.body.setSpacing(8)
         head = QHBoxLayout()
-        g = Glyph(info.glyph, 20, info.accent)
-        g.setFixedSize(44, 44)
-        g.setStyleSheet(f"color: {info.accent}; background: {T.alpha(info.accent, 0.14)}; border: 1px solid {T.alpha(info.accent, 0.3)}; border-radius: 13px;")
-        head.addWidget(g)
+        head.setSpacing(10)
+        g = Glyph(info.glyph, 17, info.accent)
+        g.setFixedSize(36, 36)
+        g.setStyleSheet(f"color: {info.accent}; background: {T.alpha(info.accent, 0.14)}; border: 1px solid {T.alpha(info.accent, 0.3)}; border-radius: 11px;")
+        head.addWidget(g, 0, Qt.AlignmentFlag.AlignTop)
         tb = QVBoxLayout()
         tb.setSpacing(1)
-        tb.addWidget(label(info.title, "H3"))
-        tb.addWidget(label(info.tagline, "Mute"))
-        head.addLayout(tb, 1)
+        tr = QHBoxLayout()
+        tr.setSpacing(6)
+        title = label(info.title, "H3")
+        title.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)  # 名前は縮めない
+        tr.addWidget(title)
+        self.pill = StatusPill(compact=True)
+        tr.addWidget(self.pill, 0, Qt.AlignmentFlag.AlignVCenter)
+        tr.addStretch(1)
         self.toggle = ToggleSwitch(False, info.accent)
         self.toggle.setToolTip("有効 / 無効")
         self.toggle.toggled.connect(self._toggled)
-        head.addWidget(self.toggle, 0, Qt.AlignmentFlag.AlignTop)
+        tr.addWidget(self.toggle, 0, Qt.AlignmentFlag.AlignVCenter)  # スイッチは名前の行に置き、一言は右端まで使う
+        tb.addLayout(tr)
+        self.tagline = label(info.tagline, "Mute", wrap=True)
+        self.tagline.setMinimumWidth(0)
+        tb.addWidget(self.tagline)
+        head.addLayout(tb, 1)
         self.body.addLayout(head)
-        self.pill = StatusPill()
-        self.status = label("", "Dim", wrap=True)
-        self.status.setMinimumHeight(34)
-        self.body.addWidget(self.pill, 0, Qt.AlignmentFlag.AlignLeft)
-        self.body.addWidget(self.status)
+        self.body.addStretch(1)  # 同じ段のカードで一言が 2 行になっても、下の段の位置をそろえる
         row = QHBoxLayout()
-        self.retry = button("再起動", "secondary", G.REFRESH, lambda: self._host.loader.restart(self.name))
+        row.setSpacing(8)
+        self.status = ElidedLabel("", "Dim")
+        row.addWidget(self.status, 1)
+        self.retry = icon_button(G.REFRESH, "再起動", lambda: self._host.loader.restart(self.name), kind="secondary")
+        self.retry.setFixedSize(30, 30)
         row.addWidget(self.retry)
-        row.addStretch(1)
-        row.addWidget(button("開く", "ghost", G.CHEVRON, lambda: open_page(self.name)))
+        self.open_btn = button("開く", "ghost", G.CHEVRON, lambda: open_page(self.name))
+        self.open_btn.setStyleSheet("padding: 5px 10px;")
+        row.addWidget(self.open_btn)
         self.body.addLayout(row)
         self.refresh()
 
@@ -345,15 +370,59 @@ class ModuleCard(Card):
         enabled = bool(self._host.settings.module_section(self.name).get("enabled", False))
         self.toggle.set_checked_silent(enabled)
         if state == "stopped" and slot is not None:
-            self.status.setText(slot.reason or "")
+            self.status.set_full_text(slot.reason or "")
             self.status.setStyleSheet(f"color: {T.DANGER};")
         elif state == "running" and slot is not None and slot.ctx is not None:
-            self.status.setText(slot.ctx.status_text or "動作中")
+            self.status.set_full_text(slot.ctx.status_text or "動作中")
             self.status.setStyleSheet("")
         else:
-            self.status.setText("オンにすると使えるようになります")
+            self.status.set_full_text("オンにすると使えるようになります")
             self.status.setStyleSheet(f"color: {T.TEXT_MUTE};")
         self.retry.setVisible(state == "stopped")
+
+
+CARD_MIN_WIDTH = 270  # これより細くなるなら列を減らす(3 列 → 2 列)
+CARD_GAP = 12
+
+
+def card_columns(width: int, max_cols: int = 3, min_width: int = CARD_MIN_WIDTH, gap: int = CARD_GAP) -> int:
+    """中身の幅に入る列の数(2〜max_cols)。窓 1220px(中身 約 910px)で 3 列、最小の 1000px(約 690px)で 2 列。"""
+    cols = max_cols
+    while cols > 2 and cols * min_width + (cols - 1) * gap > width:
+        cols -= 1
+    return cols
+
+
+class CardGrid(QWidget):
+    """モジュールカードの格子。幅に合わせて 3 列と 2 列を切り替える(カードの順は変えない)。"""
+
+    def __init__(self, cards: list[QWidget]) -> None:
+        super().__init__()
+        self._cards = cards
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setSpacing(CARD_GAP)
+        self.columns = 0
+        self._place(3)
+
+    def _place(self, cols: int) -> None:
+        if cols == self.columns:
+            return
+        for c in self._cards:
+            self._grid.removeWidget(c)
+        for i, c in enumerate(self._cards):
+            self._grid.addWidget(c, i // cols, i % cols)
+        for col in range(3):
+            self._grid.setColumnStretch(col, 1 if col < cols else 0)
+        self.columns = cols
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        # 3 列の最小の幅で窓の幅を縛らない(狭くなったら resizeEvent で 2 列に並べ直す)
+        return QSize(0, super().minimumSizeHint().height())
+
+    def resizeEvent(self, e: Any) -> None:  # noqa: N802
+        super().resizeEvent(e)
+        self._place(card_columns(e.size().width()))
 
 
 class HomePage(ScrollPage):
@@ -389,16 +458,11 @@ class HomePage(ScrollPage):
         w.setLayout(stats)
         self.add(w)
 
-        grid = QGridLayout()
-        grid.setSpacing(14)
         self.cards: dict[str, ModuleCard] = {}
-        for i, m in enumerate(catalog.MODULES):
-            c = ModuleCard(host, m.name, open_page)
-            grid.addWidget(c, i // 2, i % 2)
-            self.cards[m.name] = c
-        gw = QWidget()
-        gw.setLayout(grid)
-        self.add(gw)
+        for m in catalog.MODULES:
+            self.cards[m.name] = ModuleCard(host, m.name, open_page)
+        self.card_grid = CardGrid(list(self.cards.values()))
+        self.add(self.card_grid)
 
         lower = QHBoxLayout()
         lower.setSpacing(14)
@@ -765,6 +829,7 @@ class SettingsPage(ScrollPage):
                   G.LIGHTNING, T.ACCENT)
         self.qa_key = HotkeyEdit(str(hs.get("quick_action_hotkey") or ""))
         self.qa_key.changed.connect(self._qa_hotkey)
+        host.signals.quick_hotkey_changed.connect(self._qa_hotkey_shown)  # KeyFree から変えたときも表示を合わせる
         qa.add(SettingRow("ホットキー", "空にすると使いません。", self.qa_key, G.KEYBOARD))
         qa.add(SettingRow("今すぐ開いてみる", None, button("開く", "secondary", G.LIGHTNING, host.open_quick_actions)))
         self.add(qa)
@@ -916,9 +981,14 @@ class SettingsPage(ScrollPage):
         self.restart_btn.setVisible(effective != T.MODE)
 
     def _qa_hotkey(self, text: str) -> None:
-        self._save_host({"quick_action_hotkey": text})
-        self._host.register_host_hotkeys()
-        self._host.after_hotkey_registration()
+        try:
+            self._host.set_quick_action_hotkey(text)
+        except SettingsError as e:
+            message(self.window(), "保存できません", str(e), kind="error")
+
+    def _qa_hotkey_shown(self, text: str) -> None:
+        if not self.qa_key.hasFocus():
+            self.qa_key.setText(text)
 
     def _save_repo(self) -> None:
         from deskkit import updater

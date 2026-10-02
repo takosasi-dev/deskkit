@@ -29,9 +29,13 @@ class OpsLog:
         self._now = now or (lambda: _dt.datetime.now().astimezone())
 
     def write(self, *, trigger: str, result: str, drive_slot: int, fs: str, new: int, changed: int, unchanged: int,
-              skipped: Mapping[str, int], failed: int, bytes: int, ms: int) -> dict[str, Any]:
+              skipped: Mapping[str, int], failed: int, bytes: int, ms: int, prev_unfinished: bool = False,
+              verified: int = 0, recopied: int = 0, verify_left: int = 0) -> dict[str, Any]:
+        """prev_unfinished 以下は v0.4.1(前の回が途中で止まっていたときの手当て。件数と真偽だけ)。"""
         if trigger not in TRIGGERS or result not in RESULTS or fs not in FS_KINDS or drive_slot not in (1, 2, 3):
             raise ValueError("ops の語が決まりと違う")
+        if not isinstance(prev_unfinished, bool):
+            raise TypeError("ops の prev_unfinished は真偽だけ")
         sk: dict[str, int] = {}
         for k, v in skipped.items():
             if k not in REASONS:
@@ -42,7 +46,9 @@ class OpsLog:
             "ts": self._now().astimezone().isoformat(timespec="seconds"), "trigger": trigger, "result": result,
             "drive_slot": drive_slot, "fs": fs, "new": _int(new, "new"), "changed": _int(changed, "changed"),
             "unchanged": _int(unchanged, "unchanged"), "skipped": sk, "failed": _int(failed, "failed"),
-            "bytes": _int(bytes, "bytes"), "ms": _int(ms, "ms"),
+            "bytes": _int(bytes, "bytes"), "ms": _int(ms, "ms"), "prev_unfinished": prev_unfinished,
+            "verified": _int(verified, "verified"), "recopied": _int(recopied, "recopied"),
+            "verify_left": _int(verify_left, "verify_left"),
         }
         line = json.dumps(rec, ensure_ascii=False) + "\n"
         try:

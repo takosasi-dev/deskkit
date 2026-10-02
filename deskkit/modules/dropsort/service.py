@@ -63,6 +63,17 @@ OP_TEXT = {
 }
 
 
+def err_text(e: BaseException) -> str:
+    """ログ用の例外の説明。型名と数値のエラーコードだけにする(str(e) は OSError のパスを含むので書かない。C-12)。"""
+    head = type(e).__name__
+    if isinstance(e, OSError):
+        codes = [f"{k}={v}" for k, v in (("errno", e.errno), ("winerror", getattr(e, "winerror", None)))
+                 if isinstance(v, int)]
+        if codes:
+            head += "(" + " ".join(codes) + ")"
+    return head
+
+
 def reason_text(code: str | None) -> str:
     if not code:
         return ""
@@ -237,7 +248,7 @@ class DropSortService:
                 ds.baseline.pop(f.name.lower(), None)
                 ds.first_seen.pop(f.name.lower(), None)
             self.tracker.forget(f.name)
-            self.log.info("%s: %s → %s (rule=%s)", kind, f.path, out.dst, rec.get("rule"))
+            self.log.info("%s: 1 件", kind)  # パス・名前・ルール名(利用者の入力)は書かない(C-12)
             if events is not None:
                 events.append(dict(rec, name=f.name))
             return dict(rec, name=f.name)
@@ -250,7 +261,7 @@ class DropSortService:
             ds.set_handled(f.name, f.size, f.mtime, "decision", sig=sig, op=op, rule=rec["rule"], dst=rec["dst"])
         if (not dedupe or prev is None or prev.get("sig") != sig) and out.reason != "dest_unavailable":
             rec = self.oplog.append(rec, self.clock())
-            self.log.warning("%s: %s (%s)", op, f.path, out.reason)
+            self.log.warning("%s: 1 件 (%s)", op, out.reason)
             if events is not None:
                 events.append(dict(rec, name=f.name))
         return dict(rec, name=f.name)
@@ -286,9 +297,9 @@ class DropSortService:
         for d in reversed(missing):
             e = api.create_directory(d)
             if e not in (ERROR_SUCCESS, ERROR_ALREADY_EXISTS):
-                self.log.warning("移動先のフォルダを作成できません (Win32 エラー %s): %s", e, d)
+                self.log.warning("移動先のフォルダを作成できません (Win32 エラー %s)", e)
                 return "dest_create_failed"
-            self.log.info("移動先のフォルダを作成しました: %s", d)
+            self.log.info("移動先のフォルダを作成しました(1 件)")
         c = check_dest(api, dest, self.downloads, self.cfg.archive.dir_name)
         if not c.ok:
             return c.code or "dest_unavailable"
@@ -305,7 +316,7 @@ class DropSortService:
         try:
             snap = scan_dir(self.api, dl)
         except OSError as e:
-            self.log.warning("ダウンロードフォルダを列挙できません: %s", e)
+            self.log.warning("ダウンロードフォルダを列挙できません: %s", err_text(e))
             return CycleResult(False, "unresolved")
         problems = self.validate_rules(dl)
         sig = tuple(sorted((r.index, msg) for r, msg in problems))
@@ -331,7 +342,7 @@ class DropSortService:
                 ds.baseline[f.name.lower()] = {"name": f.name, "size": f.size, "mtime": f.mtime}
             self.store.save(st)
             res.baseline_created = len(snap.files)
-            self.log.info("基準線を記録しました: %d 件 (%s)", len(snap.files), snap.path)
+            self.log.info("基準線を記録しました: %d 件", len(snap.files))
             self._update_snapshot(ds, 0, now, res.scan_ms, len(snap.files))
             return
         present = snap.names()

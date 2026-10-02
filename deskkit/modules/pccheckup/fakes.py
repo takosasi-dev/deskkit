@@ -2,7 +2,9 @@
 # OS には触れない(psutil・winrt・レジストリ・ファイルを読まない)。
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date, datetime
 
 from deskkit.modules.pccheckup._win32 import AdapterInfo
 from deskkit.modules.pccheckup.checks.base import Cancel, GiB
@@ -26,6 +28,7 @@ from deskkit.modules.pccheckup.probes import (
 )
 
 WIFI_ID = "11111111-2222-3333-4444-555555555555"
+FAKE_TODAY = date(2026, 9, 26)   # 偽の Probes の既定の今日(証明書の期限 2026-10-19 より前)
 
 
 def sb_raw(firmware: str = "uefi", sb: RegRead | None = None, status: RegRead | None = None,
@@ -66,6 +69,8 @@ class FakeProbes:
     sb: SecureBootRaw = field(default_factory=sb_raw)
     raise_on: set[str] = field(default_factory=set)
     calls: list[str] = field(default_factory=list)
+    # 今日(B2 の期限の判定)。now を渡せばその時計の日付、無ければ FAKE_TODAY(本物の日付に頼らない)
+    now: Callable[[], float] | None = None
 
     def _hit(self, name: str) -> None:
         self.calls.append(name)
@@ -139,3 +144,6 @@ class FakeProbes:
     def secure_boot(self) -> SecureBootRaw:
         self._hit("secure_boot")
         return self.sb
+
+    def today(self) -> date:
+        return datetime.fromtimestamp(self.now()).date() if self.now is not None else FAKE_TODAY

@@ -477,7 +477,8 @@ def test_counts_match_ops(env: Env) -> None:
     assert (last["new"], last["changed"], last["unchanged"], last["skipped"], last["failed"]) == (1, 1, 3, {"excluded_name": 1}, 0)
     assert last["result"] == "ok" and last["trigger"] == "manual" and last["drive_slot"] == 1 and last["fs"] == "NTFS"
     assert set(last) == {"ts", "trigger", "result", "drive_slot", "fs", "new", "changed", "unchanged", "skipped", "failed",
-                         "bytes", "ms"}
+                         "bytes", "ms", "prev_unfinished", "verified", "recopied", "verify_left"}   # 後ろの4つは v0.4.1
+    assert (last["prev_unfinished"], last["verified"], last["recopied"], last["verify_left"]) == (False, 0, 0, 0)
 
 
 def test_mode_bits_of_dest_are_regular_files(env: Env) -> None:

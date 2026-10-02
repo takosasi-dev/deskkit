@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 from deskkit import catalog
 from deskkit.modules.plugsave import drives
 from deskkit.modules.plugsave.copier import STAGE_CLEAN, STAGE_COPY, STAGE_PLAN
-from deskkit.modules.plugsave.module import WAITING, Candidate, Notice, human_bytes
+from deskkit.modules.plugsave.module import WAITING, Candidate, Notice, human_bytes, unfinished_text
 from deskkit.modules.plugsave.planner import FAILED_REASONS, REASON_TEXT
 from deskkit.modules.plugsave.reminder import days_since, parse_ts
 from deskkit.ui import theme as T
@@ -412,6 +412,9 @@ class PlugSavePage(W.ScrollPage):
                 lay.addWidget(W.label(f"コピーするファイル: {pv.plan_new + pv.plan_changed:,} 件(合計 {human_bytes(pv.plan_bytes)})", "H3"))
                 lay.addWidget(W.label(f"すでに同じもの: {pv.unchanged:,} 件 ・ 飛ばすもの: {skipped:,} 件 ・ "
                                       f"ドライブの空き: {human_bytes(pv.free)}", "Mute", wrap=True))
+                if pv.plan_verify:
+                    lay.addWidget(W.label(f"前回は途中で止まったので、その回に書いた小さいファイル {pv.plan_verify:,} 件も中身を確かめます。",
+                                          "Mute", wrap=True))
                 if pv.truncated:
                     lay.addWidget(W.label("ファイルが多いため、1回目は一部だけをコピーし、残りは次の回にコピーします。", "Mute", wrap=True))
                 if pv.need_more:
@@ -435,6 +438,11 @@ class PlugSavePage(W.ScrollPage):
             return
         parts = [f"新しくコピー: {out.new:,} 件", f"変わったのでコピー: {out.changed:,} 件(古い版を移した数: {out.moved_old:,})",
                  f"そのまま: {out.unchanged:,} 件"]
+        line = unfinished_text(out)
+        if line:
+            parts.insert(0, line)
+        if out.recopied:
+            parts.insert(3, f"中身が欠けていたのでコピーし直した: {out.recopied:,} 件(古い方は _以前の版 へ移しました)")
         for code, n in sorted(out.skipped.items()):
             parts.append(f"飛ばした({REASON_TEXT.get(code, code)}): {n:,} 件")
         if out.failed:

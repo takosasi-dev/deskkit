@@ -33,7 +33,16 @@ from deskkit import catalog
 from deskkit.hotkeys import hotkey_label
 from deskkit.modules.keyfree import combos, keynames, scan, trykey
 from deskkit.modules.keyfree.combos import Combo
-from deskkit.modules.keyfree.module import TEXT_BLOCKED, TEXT_BUSY, TEXT_UNSUPPORTED, state_text
+from deskkit.modules.keyfree.module import (
+    QUICK_CONFLICT,
+    QUICK_HOLDER,
+    QUICK_OK,
+    QUICK_UNSUPPORTED,
+    TEXT_BLOCKED,
+    TEXT_BUSY,
+    TEXT_UNSUPPORTED,
+    state_text,
+)
 from deskkit.ui import theme as T
 from deskkit.ui import widgets as W
 from deskkit.ui.theme import G
@@ -561,6 +570,13 @@ class KeyFreePage(W.ScrollPage):
         text = self.m.format(c)
         return W.button(text, "secondary", G.COPY, _guard(lambda cc=c: self.copy(cc)), tooltip="押すとコピーします")
 
+    def _quick_button(self, c: Combo, text: str) -> QWidget:
+        b = W.button(text, "secondary", G.LIGHTNING, _guard(lambda cc=c: self.use_quick(cc)),
+                     tooltip="DeskKit のクイックアクションを開くキーをこの組にします(設定からも変えられます)")
+        res = self.m.result()
+        b.setEnabled(not (res is not None and res.running) and not self.m.scanner.single_running)
+        return b
+
     def _fill_recommend(self) -> None:
         _clear(self.rec_box)
         recs = self.m.recommendations()
@@ -609,10 +625,13 @@ class KeyFreePage(W.ScrollPage):
             lay.addLayout(head)
             why = ("ほかのアプリが使っているため、DeskKit では使えていません。" if int(f.error) == scan.ERROR_HOTKEY_ALREADY_REGISTERED
                    else f"DeskKit では使えていません(エラー {int(f.error)})。")
-            lay.addWidget(W.label(why + "設定で、下の空いている組に変えられます。", "Dim", wrap=True))
+            quick = str(f.name) == QUICK_HOLDER   # クイックアクションだけは、ここから変えられる(v0.4.1)
+            lay.addWidget(W.label(why + ("下の空いている組を押すと、そのキーに変えます。" if quick
+                                         else "設定で、下の空いている組に変えられます。"), "Dim", wrap=True))
             recs = self.m.recommendations(3)
             if recs:
-                lay.addLayout(W.hbox(*[self._copy_button(c) for c in recs], None))
+                btns = [self._quick_button(c, self.m.format(c) + " にする") if quick else self._copy_button(c) for c in recs]
+                lay.addLayout(W.hbox(*btns, None))
             else:
                 lay.addWidget(W.label("「調べる」を押すと、代わりの候補を3つ出します。", "Mute"))
             self.dk_box.addWidget(box)
@@ -708,7 +727,8 @@ class KeyFreePage(W.ScrollPage):
                 b = W.button("押して確かめる", "secondary", G.KEYBOARD, _guard(lambda cc=c: self._try(cc)),
                              tooltip=f"{m.cfg['try_seconds']} 秒だけ DeskKit がこのキーを預かり、押したら届いたかを出します")
                 b.setEnabled(not running and tk.active is None)
-                lay.addLayout(W.hbox(W.button("もう一度コピー", "ghost", G.COPY, _guard(lambda cc=c: self.copy(cc))), b, None))
+                lay.addLayout(W.hbox(W.button("もう一度コピー", "ghost", G.COPY, _guard(lambda cc=c: self.copy(cc))), b,
+                                     self._quick_button(c, "クイックアクションに使う"), None))
         elif st in (scan.USED, scan.ERROR):
             text = USED_HELP if st == scan.USED else "調べられませんでした。少し待ってから『調べ直す』を押してください。"
             lay.addWidget(W.label(text, "Dim", wrap=True))
@@ -763,6 +783,15 @@ class KeyFreePage(W.ScrollPage):
             cb.setText(text)
         self.m.note_copy()
         self.toast.show_text(f"{text} をコピーしました")
+
+    def use_quick(self, c: Combo) -> None:
+        name = self.m.format(c)
+        r = self.m.use_for_quick_action(c)
+        self.toast.show_text({QUICK_OK: f"クイックアクションのキーを {name} にしました",
+                              QUICK_CONFLICT: f"{name} は今ほかのアプリが使っています。クイックアクションのキーは前のままです",
+                              scan.RUNNING: TEXT_BUSY, QUICK_UNSUPPORTED: TEXT_UNSUPPORTED}
+                             .get(r, "クイックアクションのキーを変えられませんでした。設定の画面から変えてください"))
+        self._refresh()
 
     def _try(self, c: Combo) -> None:
         r = self.m.try_key(c)

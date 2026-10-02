@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from deskkit import catalog
 from deskkit.context import ModuleContextImpl
 
 if TYPE_CHECKING:
@@ -30,6 +31,11 @@ def module_package(name: str) -> str:
     if name.startswith("_selftest_"):
         return f"deskkit.selftest_modules.{name}"
     return f"deskkit.modules.{name}"
+
+
+def _title(name: str) -> str:
+    """ログの文言に出す名前。内部名(modeshift)ではなく表示名(ModeShift)にする(v0.4.1)。ロガー名はそのまま。"""
+    return catalog.info(name).title
 
 
 def _short(e: BaseException) -> str:
@@ -75,7 +81,7 @@ class Loader(QObject):
             module = pkg.create(ctx)
             module.start()
         except Exception as e:  # noqa: BLE001 - モジュールの失敗を隔離する(D-2)
-            log.exception("モジュール %s の起動に失敗", name)
+            log.exception("%s の起動に失敗しました", _title(name))
             ctx.teardown()
             slot.module = None
             self._set(slot, "stopped", _short(e))
@@ -84,7 +90,7 @@ class Loader(QObject):
         self._set(slot, "running", None)
         if not ctx.status_text:
             self._host.tray.set_module_status(name, "動作中")
-        log.info("モジュール %s を起動しました", name)
+        log.info("%s を起動しました", _title(name))
 
     def stop_one(self, name: str, *, state: str = "disabled", reason: str | None = None) -> None:
         slot = self.slots.get(name)
@@ -94,7 +100,7 @@ class Loader(QObject):
             try:
                 slot.module.stop()
             except Exception:  # noqa: BLE001
-                log.exception("モジュール %s の stop で例外", name)
+                log.exception("%s を止めるときに例外", _title(name))
         if slot.ctx is not None:
             slot.ctx.teardown()
         slot.module = None
@@ -118,7 +124,7 @@ class Loader(QObject):
         QTimer.singleShot(0, lambda: self._do_fault(name, reason))
 
     def _do_fault(self, name: str, reason: str) -> None:
-        log.error("モジュール %s を停止中にしました: %s", name, reason)
+        log.error("%s を停止中にしました: %s", _title(name), reason)
         self.stop_one(name, state="stopped", reason=reason)
         self._host.notify("host", f"{self._host.title_of(name)} を停止しました", reason, None, level="error")
 

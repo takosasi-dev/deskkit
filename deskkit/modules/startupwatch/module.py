@@ -71,12 +71,18 @@ class ViewItem:
         return out
 
 
-def validate(section: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """§9: 合わない値は既定値に戻す。(直した設定, 直したキー)。"""
+def validate_detail(section: Mapping[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
+    """§9: 合わない値・無いキーは既定値にする。(直した設定, 値が合わなかったキー, 無かったキー)。
+    v0.4.1: 無いキー(初回など)は警告しないので、値が合わなかったキーと分けて返す。"""
     out = {k: v for k, v in section.items() if k != "enabled"}
     fixed: list[str] = []
+    filled: list[str] = []
     for k, dv in DEFAULTS.items():
-        v = out.get(k)
+        if k not in out:
+            out[k] = dv
+            filled.append(k)
+            continue
+        v = out[k]
         if isinstance(dv, bool):
             ok = isinstance(v, bool)
         else:
@@ -85,7 +91,13 @@ def validate(section: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
         if not ok:
             out[k] = dv
             fixed.append(k)
-    return out, fixed
+    return out, fixed, filled
+
+
+def validate(section: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """§9: 合わない値・無いキーは既定値に戻す。(直した設定, 直したキー(無かったキーも含む))。"""
+    out, fixed, filled = validate_detail(section)
+    return out, [k for k in DEFAULTS if k in fixed or k in filled]
 
 
 def deskkit_programs(executable: str | None = None) -> set[str]:
@@ -121,9 +133,9 @@ class StartupWatchModule:
                  executable: str | None = None) -> None:
         self.ctx = ctx
         self.log: logging.Logger = ctx.log
-        section, fixed = validate(dict(ctx.settings_dict()))
-        if fixed:
-            for k in fixed:
+        section, fixed, filled = validate_detail(dict(ctx.settings_dict()))
+        if fixed or filled:
+            for k in fixed:  # 警告は値が合わなかったキーだけ。無いキー(初回)は黙って既定値を入れる
                 self.log.warning("settings_fixed key=%s", k)
             try:
                 ctx.write_settings(section)

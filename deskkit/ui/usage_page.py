@@ -1,6 +1,7 @@
 # 利用状況ページ。動作中の各モジュールの usage(days) を呼び、指標ごとの小さな棒グラフ(1系列1グラフ)にする。
 # 色はモジュールの識別色(theme.chart_color。明度帯・色覚差を検証済み)。文字は常に文字色。棒にマウスを載せると日付と件数。
 # 表示するのは日ごとの件数だけ(本文・パスは扱わない)。表でも見られる。usage() は別スレッドで集計し、期間ごとに結果を覚える(UX-5)。
+# (v0.4.1)選んだ期間に記録が 1 件も無いモジュールはグラフ・表を出さず、下にまとめて 1 行ずつにする(グラフでも表でも同じ)。
 from __future__ import annotations
 
 import datetime as _dt
@@ -171,6 +172,44 @@ def _series_card(s: UsageSeries, color: str, end: _dt.date) -> QWidget:
     return w
 
 
+EMPTY_TEXT = "この期間の記録はありません"
+
+
+def has_records(series: list[UsageSeries]) -> bool:
+    """選んだ期間に 1 件でも記録があるか(どの指標のどの日でも 0 より大きい値があるか)。"""
+    return any(v > 0 for s in series for v in s.per_day)
+
+
+class EmptyRow(QWidget):
+    """記録の無いモジュールの 1 行(アイコン・名前・「この期間の記録はありません」)。"""
+
+    def __init__(self, m: catalog.ModuleInfo) -> None:
+        super().__init__()
+        self.name = m.name
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(10)
+        g = Glyph(m.glyph, 14, m.accent)
+        g.setFixedSize(28, 28)
+        g.setStyleSheet(f"color: {m.accent}; background: {T.alpha(m.accent, 0.12)}; border-radius: 8px;")
+        lay.addWidget(g)
+        t = label(m.title, "H3")
+        t.setMinimumWidth(110)
+        lay.addWidget(t)
+        lay.addWidget(label(EMPTY_TEXT, "Mute"), 1)
+
+
+class EmptyList(Card):
+    """記録の無いモジュールをまとめた 1 枚(グラフ・表は出さない)。"""
+
+    def __init__(self, mods: list[catalog.ModuleInfo]) -> None:
+        super().__init__(padding=16)
+        self.body.setSpacing(2)
+        self.rows = [EmptyRow(m) for m in mods]
+        for r in self.rows:
+            self.add(r)
+
+
 CACHE_TTL_S = 120.0  # 同じ期間をこの時間内に開き直したら集計し直さない
 Results = dict[str, "list[UsageSeries] | BaseException"]
 
@@ -322,18 +361,14 @@ class UsagePage(ScrollPage):
             if w is not None:
                 w.deleteLater()
         end = _dt.date.today()
-        any_running = False
-        for m in catalog.MODULES:
-            if m.name not in results:
-                continue
-            any_running = True
+        mods = [m for m in catalog.MODULES if m.name in results]
+        # (v0.4.1)記録のあるモジュールを上に(中の順は catalog のまま)、この期間に 1 件も無いモジュールは下に 1 行ずつ
+        with_records = [m for m in mods if has_records(results[m.name])]
+        empty = [m for m in mods if not has_records(results[m.name])]
+        for m in with_records:
             color = T.chart_color(m.name)
             card = Card(m.title, m.tagline, m.glyph, m.accent)
             series = results[m.name]
-            if not series:
-                card.add(label("このモジュールはまだ集計できるデータがありません。", "Mute"))
-                self.box.addWidget(card)
-                continue
             prim = next((s for s in series if s.primary), series[0])
             ptotal = sum(prim.per_day)
             head = QHBoxLayout()
@@ -350,7 +385,9 @@ class UsagePage(ScrollPage):
                     grid.addWidget(_series_card(s, color, end), i // 2, i % 2)
                 card.add_layout(grid)
             self.box.addWidget(card)
-        if not any_running:
+        if empty:
+            self.box.addWidget(EmptyList(empty))
+        if not mods:
             self.box.addWidget(EmptyState(G.LIST, "動作中のモジュールがありません", "ホームでモジュールをオンにすると、ここに利用状況が出ます。"))
 
     def _table(self, series: list[UsageSeries], days: int, end: _dt.date) -> QTableWidget:

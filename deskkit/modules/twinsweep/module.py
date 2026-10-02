@@ -268,6 +268,8 @@ class TwinSweepModule:
         if not roots:
             self.signals.notices.emit()
             return MSG_FORBIDDEN
+        if self.model is not None:
+            self.model.reset_choices()  # v0.4.1: 新しいスキャンを始めたら、覚えた選び直しは捨てる
         req = ScanRequest(roots=roots, recursive=bool(self.config["recursive"]), level=str(self.config["level"]),
                           exact_only=bool(self.config["exact_only"]), excluded=excluded, cache_path=self.cache_path)
         self._cancel = threading.Event()

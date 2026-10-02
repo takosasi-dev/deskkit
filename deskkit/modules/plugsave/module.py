@@ -79,6 +79,31 @@ def start_text(delay: int) -> str:
     return f"登録したドライブがつながりました。{delay} 秒後に始めます。やめるときは、この通知を押してください。"
 
 
+def unfinished_text(out: BackupOutcome) -> str | None:
+    """前回の結果の欄の1行(v0.4.1。前の回が途中で止まっていたときの手当て)。止まっていなければ None。件数だけを入れる。"""
+    if not out.prev_unfinished:
+        return None
+    if not out.check_all_small:
+        what = "その回に書いた小さいファイルを"
+    elif out.check_reason == "legacy":
+        what = "前の版の DeskKit が残した印なので、小さいファイルをすべて"
+    elif out.check_reason == "clock":
+        what = "時計が戻っていたため、小さいファイルをすべて"
+    else:
+        what = "作成日時で見分けられないため、小さいファイルをすべて"
+    if out.prev_pending:      # 前の回の分で確かめ終えていない物がある(印を残した)
+        if not out.checked:
+            return "前回は途中で止まりました。その回に書いた小さいファイルは、次の回に確かめます。"
+        return (f"前回は途中で止まったので、{what}確かめました(確かめた数: {out.checked:,} 件・もう一度コピーした数: "
+                f"{out.recopied:,} 件)。確かめ終えていない分は次の回に確かめます。")
+    if out.recopied:
+        return (f"前回は途中で止まったので、{what}確かめ、中身の違った {out.recopied:,} 件をもう一度コピーしました"
+                f"(確かめた数: {out.checked:,} 件)。")
+    if out.checked:
+        return f"前回は途中で止まったので、{what}確かめました({out.checked:,} 件。中身はすべて合っていました)。"
+    return "前回は途中で止まりましたが、その回に書き終えた小さいファイルはありませんでした。"
+
+
 @dataclass(frozen=True)
 class Notice:
     kind: str   # info / ok / warn / error
@@ -757,7 +782,8 @@ class PlugSaveModule:
         try:
             self.ops.write(trigger=r.trigger, result=out.result, drive_slot=self.slot_of(r.drive_id), fs=drives.fs_kind(r.fs),
                            new=out.new, changed=out.changed, unchanged=out.unchanged, skipped=out.skipped,
-                           failed=out.failed, bytes=out.bytes, ms=out.ms)
+                           failed=out.failed, bytes=out.bytes, ms=out.ms, prev_unfinished=out.prev_unfinished,
+                           verified=out.verified, recopied=out.recopied, verify_left=out.verify_left)
         except (TypeError, ValueError) as e:
             self.log.error("ops write refused: %s", type(e).__name__)
 
@@ -785,6 +811,10 @@ class PlugSaveModule:
         self.log.info("backup done result=%s trigger=%s new=%d changed=%d moved_old=%d unchanged=%d skipped=%d failed=%d "
                       "bytes=%d ms=%d cleaned=%d exc=%s", out.result, r.trigger, out.new, out.changed, out.moved_old,
                       out.unchanged, out.skipped_total, out.failed, out.bytes, out.ms, out.cleaned_parts, out.exc_type or "-")
+        if out.prev_unfinished or out.markers_left or out.birth_fix_failed:
+            self.log.info("unfinished runs prev=%s all_small=%s reason=%s verified=%d recopied=%d verify_left=%d pending=%s "
+                          "markers_left=%d birth_fix_failed=%d", out.prev_unfinished, out.check_all_small, out.check_reason or "-",
+                          out.verified, out.recopied, out.verify_left, out.prev_pending, out.markers_left, out.birth_fix_failed)
         cfg = self.drive_cfg(r.drive_id)
         if out.result == OK and cfg is not None:
             cfg["last_success_at"] = self._now().isoformat(timespec="seconds")   # B-13
@@ -837,6 +867,8 @@ class PlugSaveModule:
                     text += f"・飛ばした {skipped:,} 件"
             else:
                 text = f"コピー {out.copied:,} 件・飛ばした {skipped:,} 件"
+            if out.recopied:
+                text += f"・前回の途中で欠けていた {out.recopied:,} 件を直しました"
             loud = out.failed > 0 or any(k not in QUIET_REASONS for k in out.skipped)
             self._notify(N_DONE_TITLE, text, self._show_page, level="warn" if loud else "ok")    # FR-23
         elif out.result == REMOVED:
@@ -1162,7 +1194,8 @@ class PlugSaveModule:
 
         today = self._now().date()   # 渡された時計の日付で区切る(テストの固定の時計と実際の日付がずれても数え違えない)
         runs = self.ops.per_day(days, lambda r: 1 if r.get("result") == "ok" else 0, today)
-        files = self.ops.per_day(days, lambda r: int(r.get("new", 0)) + int(r.get("changed", 0)), today)
+        files = self.ops.per_day(days, lambda r: int(r.get("new", 0)) + int(r.get("changed", 0)) + int(r.get("recopied", 0)),
+                                 today)
         return [
             UsageSeries("backups", "バックアップした回数", runs, unit="回", primary=True,
                         hint="公開から 90 日で 0 回のままなら紹介から外す(R-2)"),

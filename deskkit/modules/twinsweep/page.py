@@ -498,7 +498,8 @@ class TwinSweepPage(QWidget):
         self.level_seg = W.Segmented([("strict", "厳しめ"), ("normal", "ふつう"), ("loose", "ゆるめ")],
                                      str(self.m.config["level"]), self.accent)
         self.level_seg.changed.connect(guard(self._on_level))
-        card.add(W.SettingRow("似ている度合い", "「ゆるめ」ほど、少し違う写真も同じグループに入ります。変えてもすぐに並べ直します。",
+        card.add(W.SettingRow("似ている度合い", "「ゆるめ」ほど、少し違う写真も同じグループに入ります。"
+                              "変えてもすぐに並べ直し、選び直した「残す」「ごみ箱へ」は引き継ぎます。",
                               self.level_seg))
         self.mode_seg = W.Segmented([("similar", "似ている写真も"), ("exact", "まったく同じ写真だけ")],
                                     "exact" if self.m.config["exact_only"] else "similar", self.accent)

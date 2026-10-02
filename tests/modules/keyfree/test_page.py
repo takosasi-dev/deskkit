@@ -192,6 +192,68 @@ def test_page_rebuilt_after_module_changes(make_module: Any) -> None:
     assert "調べた結果" in page2.pill.text()
 
 
+def _fake_quick(ctx: Any, ok: bool = True) -> list[str]:
+    """ctx.set_quick_action_hotkey の偽物(v0.4.1)。ok なら host.quick をその組で持ったことにする。"""
+    got: list[str] = []
+
+    def set_quick(text: str, *, revert_on_fail: bool = False) -> bool:
+        assert revert_on_fail          # KeyFree から選んだときは、取れなければ前のキーに戻してもらう
+        got.append(text)
+        if ok:
+            ctx.hotkeys.failed = []
+            ctx.hotkeys.held["host.quick"] = ctx.hotkeys.parse(text)
+        return ok
+
+    ctx.set_quick_action_hotkey = set_quick
+    return got
+
+
+def test_quick_action_from_deskkit_card(make_module: Any) -> None:
+    """v0.4.1: クイックアクションが取れていないとき、候補を押すとそのキーに変わる。"""
+    m, ctx = make_module()
+    ctx.hotkeys.failed = [FailedKey("host.quick", C | A, SPACE, 1409)]
+    ctx.hotkeys.used.add((C | A, SPACE))
+    got = _fake_quick(ctx)
+    page = KeyFreePage(m)
+    assert "「調べる」を押すと、代わりの候補を3つ出します。" in _labels(page.dk_card)
+    _scan(page, ctx)
+    assert "下の空いている組を押すと、そのキーに変えます。" in _labels(page.dk_card)
+    btns = [b for b in page.dk_card.findChildren(type(page.scan_btn)) if b.text().endswith(" にする")]
+    assert len(btns) == 3
+    target = m.recommendations(3)[0]
+    btns[0].click()
+    assert got == [m.format(target)]
+    assert page.toast.text() == f"クイックアクションのキーを {m.format(target)} にしました"
+    res = m.result()
+    assert res is not None and res.state(target) == scan.DESKKIT and res.held_names[target] == "host.quick"
+    assert "ほかのアプリが使っているため" not in _labels(page.dk_card)
+    # もう一度ほかの組にすると、前の組は「まだ調べていない」に戻る
+    other = m.recommendations(3)[0]
+    assert m.use_for_quick_action(other) == module.QUICK_OK
+    assert res.state(other) == scan.DESKKIT and res.state(target) == scan.PENDING
+    assert list(res.held_names.values()).count("host.quick") == 1
+
+
+def test_quick_action_from_detail_conflict(make_module: Any) -> None:
+    """空きの組の詳しい欄の「クイックアクションに使う」。直前に取られていたら使用中に直して知らせる。"""
+    m, ctx = make_module()
+    got = _fake_quick(ctx, ok=False)
+    page = KeyFreePage(m)
+    _scan(page, ctx)
+    page.groups[3].caps[(C | A | S, K)].click()
+    b = next(b for b in page.groups[3].detail.findChildren(type(page.scan_btn)) if "クイックアクションに使う" in b.text())
+    b.click()
+    assert got == ["Ctrl+Alt+Shift+K"]
+    assert page.toast.text() == "Ctrl+Alt+Shift+K は今ほかのアプリが使っています。クイックアクションのキーは前のままです"
+    assert m.result().state((C | A | S, K)) == scan.USED  # type: ignore[union-attr]
+
+
+def test_quick_action_old_host(make_module: Any) -> None:
+    m, ctx = make_module()
+    _scan(KeyFreePage(m), ctx)
+    assert m.use_for_quick_action((C | A | S, K)) == module.QUICK_UNSUPPORTED   # 古い本体(ctx に入口が無い)
+
+
 def test_settings_controls(make_module: Any) -> None:
     m, ctx = make_module()
     page = KeyFreePage(m)

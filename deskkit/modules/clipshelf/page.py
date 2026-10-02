@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
@@ -32,8 +33,9 @@ from PySide6.QtWidgets import (
 from deskkit.modules.clipshelf import policy
 from deskkit.modules.clipshelf.config import SHORT_LIVED_MAX_MINUTES, normalize_exe
 from deskkit.modules.clipshelf.editor import SnippetEditor
-from deskkit.modules.clipshelf.module import REASON_LABELS
+from deskkit.modules.clipshelf.module import REASON_LABELS, TransferResult
 from deskkit.modules.clipshelf.palette import guard
+from deskkit.modules.clipshelf.transfer import MAX_SNIPPETS
 from deskkit.ui import theme as T
 from deskkit.ui import widgets as W
 from deskkit.ui.theme import G
@@ -234,6 +236,16 @@ class ClipShelfPage(W.ScrollPage):
         self.snip_list.currentItemChanged.connect(guard(lambda *_a: self._on_snippet_selected()))
         left.addWidget(self.snip_list, 1)
         left.addWidget(W.button("新しい定型文", "secondary", G.ADD, on_click=guard(self._new_snippet)))
+        # v0.4.1(Q-9): 定型文だけをファイルへ書き出す・ファイルから足す。書き出しは平文なので確認の窓を出す
+        io_row = QHBoxLayout()
+        io_row.setSpacing(6)
+        self.snip_export = W.button("書き出す", "ghost", G.DOWNLOAD, on_click=guard(self._export_snippets),
+                                    tooltip="定型文だけを 1 つのファイル(JSON)に書き出します。暗号化されません。")
+        self.snip_import = W.button("読み込む", "ghost", G.FOLDER, on_click=guard(self._import_snippets),
+                                    tooltip="書き出したファイルの定型文を、今の定型文に足します。")
+        io_row.addWidget(self.snip_export, 1)
+        io_row.addWidget(self.snip_import, 1)
+        left.addLayout(io_row)
         body.addLayout(left)
         right = QVBoxLayout()
         right.setSpacing(8)
@@ -253,7 +265,8 @@ class ClipShelfPage(W.ScrollPage):
         card.add_layout(body)
         self.add(card)
 
-    def _reload_snippet_list(self, select_id: int | None = None) -> None:
+    def _reload_snippet_list(self, select_id: int | None = None, *, keep_editor: bool = False) -> None:
+        """keep_editor なら一覧だけを作り直し、編集中の内容(未保存の変更)には触れない。"""
         store = self.m.store
         items = sorted(store.snippets(), key=lambda i: (i.name or "").casefold()) if store else []
         self.snip_list.blockSignals(True)
@@ -265,6 +278,10 @@ class ClipShelfPage(W.ScrollPage):
             self.snip_list.addItem(li)
             if it.id == (select_id if select_id is not None else self._current_snippet):
                 target_row = row
+        if keep_editor:
+            self.snip_list.setCurrentRow(target_row)
+            self.snip_list.blockSignals(False)
+            return
         self.snip_list.blockSignals(False)
         if target_row >= 0:
             self.snip_list.setCurrentRow(target_row)
@@ -338,6 +355,90 @@ class ClipShelfPage(W.ScrollPage):
         self._dirty = False
         self._reload_snippet_list()
         self._flash("定型文を削除しました")
+
+    # ---------------------------------------------------------------- 書き出し・読み込み(v0.4.1、Q-9)
+    # ファイルの選択窓(_ask_*_path)と、選んだパスで動く処理(*_to / *_from)を分けてある。テストは後者を直接呼ぶ。
+    def export_confirm_text(self, n: int) -> str:
+        bad = self.m.store.undecryptable_counts()["snippets"] if self.m.store is not None else 0
+        lines = [
+            "書き出したファイルは暗号化されません。このファイルは誰でも読めます"
+            "(メモ帳などで開くと、定型文の名前と本文がそのまま見えます)。",
+            "パスワードや個人情報を含む定型文があるときは、共有フォルダ・クラウド・USB メモリに置かないでください。"
+            "使い終わったら削除してください。",
+            "",
+            f"定型文 {n:,} 件を、選んだ場所の 1 つのファイル(JSON)に書き出します。履歴は書き出しません。",
+        ]
+        if bad:
+            lines += ["", f"復号できない定型文 {bad:,} 件は書き出せません。"]
+        return "\n".join(lines)
+
+    def _export_snippets(self) -> None:
+        store = self.m.store
+        n = len(store.snippets()) if store is not None else 0
+        if n == 0:
+            W.message(self._parent(), "書き出せません", "書き出す定型文がありません。", kind="info")
+            return
+        ok, _ = W.confirm(self._parent(), "定型文を書き出す(暗号化されません)", self.export_confirm_text(n),
+                          ok_text="平文で書き出す", danger=True, glyph=G.WARNING)
+        if not ok:
+            return
+        path = self._ask_export_path()
+        if path:
+            self.export_snippets_to(path)
+
+    def _ask_export_path(self) -> str:
+        from PySide6.QtWidgets import QFileDialog
+
+        name = f"ClipShelf-snippets-{self.m.now():%Y%m%d}.json"
+        path, _ = QFileDialog.getSaveFileName(self._parent(), "定型文を書き出す(暗号化されません)",
+                                              str(Path.home() / "Documents" / name), "JSON (*.json)")
+        return str(path or "")
+
+    def export_snippets_to(self, path: str) -> TransferResult:
+        r = self.m.export_snippets(path)
+        if r.ok:
+            self._flash(f"定型文を {r.count:,} 件書き出しました")
+        else:
+            W.message(self._parent(), "書き出せませんでした", r.error or "", kind="error")
+        return r
+
+    def _import_snippets(self) -> None:
+        path = self._ask_import_path()
+        if path:
+            self.import_snippets_from(path)
+
+    def _ask_import_path(self) -> str:
+        from PySide6.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getOpenFileName(self._parent(), "定型文を読み込む", str(Path.home() / "Documents"),
+                                              "JSON (*.json);;すべてのファイル (*.*)")
+        return str(path or "")
+
+    @staticmethod
+    def import_summary(r: TransferResult) -> tuple[str, str]:
+        """読み込みの結果の (文, 種類)。"""
+        if not r.ok:
+            return f"{r.error or ''}\n定型文は変えていません。", "error"
+        lines = [f"定型文を {r.count:,} 件足しました。" if r.count else "足した定型文はありません。"]
+        if r.duplicates:
+            lines.append(f"同じ名前・同じ本文の定型文が既にあるため、{r.duplicates:,} 件は足しませんでした。")
+        if r.over_limit:
+            lines.append(f"定型文は {MAX_SNIPPETS:,} 件までのため、{r.over_limit:,} 件は足しませんでした。")
+        if r.read == 0:
+            lines.append("ファイルに定型文がありませんでした。")
+        lines += ["", "読み込んだファイルは暗号化されていません。要らなければ削除してください。"]
+        kind = "warn" if r.over_limit else ("ok" if r.count else "info")
+        return "\n".join(lines), kind
+
+    def import_snippets_from(self, path: str) -> TransferResult:
+        r = self.m.import_snippets(path)
+        text, kind = self.import_summary(r)
+        if r.ok:
+            self._reload_snippet_list(keep_editor=self._dirty)  # 編集中の未保存の変更は消さない
+            if r.count:
+                self._flash(f"定型文を {r.count:,} 件読み込みました")
+        W.message(self._parent(), "読み込みました" if r.ok else "読み込めませんでした", text, kind=kind)
+        return r
 
     # ================================================================ 除外設定
     def _build_exclusions(self) -> None:

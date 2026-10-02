@@ -44,6 +44,10 @@ TEXT_BAD_SYNTAX = "キーの書き方が分かりません(例: Ctrl+Alt+K)"
 TEXT_CANCELLED = "途中で止めました"
 TEXT_FAILED = "調べる途中で問題が起きました。もう一度調べてください"
 
+# use_for_quick_action の戻り値(v0.4.1)
+QUICK_HOLDER = "host.quick"
+QUICK_OK, QUICK_CONFLICT, QUICK_ERROR, QUICK_UNSUPPORTED = "quick_ok", "quick_conflict", "quick_error", "quick_unsupported"
+
 
 def normalize(section: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """型・範囲の合わない値を既定値に戻す。(設定, 変えたか)。"""
@@ -232,6 +236,30 @@ class KeyFreeModule:
 
     def note_copy(self) -> None:
         self.ops.write("copy")
+
+    # ================================================================ クイックアクションのキーにする(v0.4.1、仕様書 Q-4 の見直し)
+    def use_for_quick_action(self, combo: Combo) -> str:
+        """空きの組を DeskKit のクイックアクションのキーにする。戻り値は QUICK_* のどれか。
+        押して確かめるの途中なら先に返す(同じ組を預かっていると登録できないため)。"""
+        fn = getattr(self.ctx, "set_quick_action_hotkey", None)
+        if not callable(fn):
+            return QUICK_UNSUPPORTED
+        if self.scanner.running or self.scanner.single_running:
+            return scan.RUNNING
+        self.trykey.stop()
+        try:
+            ok = bool(fn(self.format(combo), revert_on_fail=True))   # 取れなければ前のキーのまま(使えていたキーを失わない)
+        except Exception as e:  # noqa: BLE001 - 設定を書けないときなど。画面で知らせる
+            self.log.warning("quick action key failed: %s", type(e).__name__)
+            return QUICK_ERROR
+        self.ops.write("quick_key", ok=ok)
+        if ok:
+            self.scanner.mark_holder(combo, QUICK_HOLDER)
+        else:
+            self.scanner.mark_used(combo)            # 直前にほかのアプリが取った
+        self._update_status()
+        self._changed()
+        return QUICK_OK if ok else QUICK_CONFLICT
 
     def snapshot(self) -> Any | None:
         fn = getattr(getattr(self.ctx, "hotkeys", None), "snapshot", None)

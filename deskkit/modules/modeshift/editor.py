@@ -467,6 +467,12 @@ class ActionDialog(W.StyledDialog):
 
 
 # ------------------------------------------------------------------ 行の表示
+# 行を setItemWidget で置く一覧は、theme の「QListWidget::item { padding: 6px 4px }」の分だけ行の窓が縮み、
+# 高さを行の sizeHint にしても 2 行目(meeting など)の下が切れていた(v0.4.1)。余白は行の側(setContentsMargins)で持つので、
+# この一覧だけ項目の padding を 0 にする(色・角丸・hover は theme のまま)。
+ROW_LIST_QSS = "QListWidget::item { padding: 0px; }"
+
+
 class _ModeRow(QWidget):
     def __init__(self, m: dict[str, Any], accent: str, errors: list[str], confirmed: bool) -> None:
         super().__init__()
@@ -541,6 +547,7 @@ class ModeEditor(QWidget):
         left = QVBoxLayout()
         left.setSpacing(8)
         self.modes = QListWidget()
+        self.modes.setStyleSheet(ROW_LIST_QSS)
         self.modes.setMinimumWidth(240)
         self.modes.setMaximumWidth(280)
         self.modes.setMinimumHeight(360)
@@ -640,6 +647,7 @@ class ModeEditor(QWidget):
         ah.addWidget(self.btn_add)
         lay.addLayout(ah)
         self.act_list = QListWidget()
+        self.act_list.setStyleSheet(ROW_LIST_QSS)
         self.act_list.setMinimumHeight(230)
         self.act_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.act_list.itemDoubleClicked.connect(guard(lambda _i: self._edit_action()))

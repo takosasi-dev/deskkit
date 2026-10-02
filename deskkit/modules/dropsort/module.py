@@ -15,7 +15,7 @@ from deskkit.modules.dropsort.cli import run_command
 from deskkit.modules.dropsort.config import Config, ConfigError, fill_defaults, load_config
 from deskkit.modules.dropsort.notifier import Notifier
 from deskkit.modules.dropsort.oplog import LockBusyError
-from deskkit.modules.dropsort.service import BatchResult, CycleResult, DropSortService, UndoResult, reason_text
+from deskkit.modules.dropsort.service import BatchResult, CycleResult, DropSortService, UndoResult, err_text, reason_text
 from deskkit.modules.dropsort.stats import RuleStats
 
 TITLE = "DropSort"
@@ -35,7 +35,7 @@ class DropSortModule:
             try:
                 ctx.write_settings(sec)  # 足りないキーを既定値で書き戻す
             except Exception as e:  # noqa: BLE001 - 書けなくても既定値で動く
-                ctx.log.warning("既定値を settings.json に書き戻せません: %s", e)
+                ctx.log.warning("既定値を settings.json に書き戻せません: %s", err_text(e))
         if api is None:
             from deskkit.modules.dropsort._win32 import RealWin32
 
@@ -327,7 +327,7 @@ class DropSortModule:
         try:
             self.ctx.set_tray_status(self.status_line())
         except Exception as e:  # noqa: BLE001
-            self.ctx.log.debug("トレイの状態を更新できません: %s", e)
+            self.ctx.log.debug("トレイの状態を更新できません: %s", err_text(e))
         item = self._tray.get("pause")
         if item is not None:
             item.set_checked(self.cfg.paused)
@@ -402,7 +402,7 @@ class DropSortModule:
             try:
                 cb()
             except Exception as e:  # noqa: BLE001 - 画面側の不具合で処理を止めない
-                self.ctx.log.warning("画面の更新で例外: %s", e)
+                self.ctx.log.warning("画面の更新で例外: %s", err_text(e))
 
     def create_page(self) -> Any:
         from deskkit.modules.dropsort.page import DropSortPage
@@ -437,7 +437,7 @@ class DropSortModule:
         try:
             self.ctx.write_settings(sec)
         except Exception as e:  # noqa: BLE001
-            self.ctx.log.warning("一時停止の状態を保存できません: %s", e)
+            self.ctx.log.warning("一時停止の状態を保存できません: %s", err_text(e))
         self.cfg = dataclasses.replace(self.cfg, paused=bool(paused))
         self.service.set_config(self.cfg)
         self._update_status()

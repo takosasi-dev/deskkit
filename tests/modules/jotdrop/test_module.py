@@ -34,10 +34,11 @@ def ops(ctx: Any) -> list[dict[str, Any]]:
 
 # ------------------------------------------------------------------ 設定・ホットキー
 def test_defaults_and_normalize() -> None:
-    cfg, changed = normalize({})
+    today = datetime(2026, 9, 26, 12, 0)
+    cfg, changed = normalize({}, today)
     assert changed and cfg["hotkey"] == "" and cfg["file_pattern"] == "{date}.md" and cfg["line_format"] == "- {time} {text}"
     cfg2, _ = normalize({"max_chars": 99999, "undo_minutes": 0, "line_format": "no text", "newline": "cr",
-                         "file_pattern": "CON.md", "blank_line_before": 1, "separator": "a\nb"})
+                         "file_pattern": "CON.md", "blank_line_before": 1, "separator": "a\nb"}, today)
     assert cfg2["max_chars"] == 5000 and cfg2["undo_minutes"] == 1 and cfg2["line_format"] == "- {time} {text}"
     assert cfg2["newline"] == "auto" and cfg2["file_pattern"] == "{date}.md" and cfg2["blank_line_before"] is False
     assert cfg2["separator"] == ""

@@ -7,14 +7,16 @@ import json
 import logging
 from collections import Counter, deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from deskkit.catalog import info
 from deskkit.modules.clipshelf import config as cfgmod
-from deskkit.modules.clipshelf import policy, search, snippets, transforms
+from deskkit.modules.clipshelf import policy, search, snippets, transfer, transforms
 from deskkit.modules.clipshelf._win32 import WM_CLIPBOARDUPDATE, RealWin32, Win32Api
 from deskkit.modules.clipshelf.crypto import Cipher, CryptoError, DpapiCipher
 from deskkit.modules.clipshelf.monitor import ClipMonitor, Decision
@@ -58,6 +60,18 @@ REASON_LABELS: dict[str, str] = {
     policy.PAUSED: "一時停止中",
     policy.CLIPBOARD_BUSY: "クリップボード使用中",
 }
+
+
+@dataclass(frozen=True)
+class TransferResult:
+    """定型文の書き出し・読み込みの結果。error は利用者向けの短い文(パス・本文を含めない)。"""
+
+    ok: bool
+    count: int = 0          # 書き出した件数 / 足した件数
+    duplicates: int = 0     # 読み込み: 同じ名前・同じ本文が既にあったので足さなかった件数
+    over_limit: int = 0     # 読み込み: 件数の上限を超えるので足さなかった件数
+    read: int = 0           # 読み込み: ファイルにあった件数
+    error: str | None = None
 
 
 class _Notifier(QObject):
@@ -320,6 +334,10 @@ class ClipShelfModule:
         self.notifier.changed.emit()
 
     # ================================================================ 状態
+    def now(self) -> datetime:
+        """モジュールの時計(画面が日付を出すとき用)。"""
+        return self._now()
+
     def counts(self) -> dict[str, int]:
         if self.store is None:
             return {"history": 0, "pinned": 0, "snippets": 0, "undecryptable": 0}
@@ -622,6 +640,55 @@ class ClipShelfModule:
             self.log.info("snippet saved id=%d", item.id)
         self.notifier.changed.emit()
         return item
+
+    # ---------------------------------------------------------------- 定型文の書き出し・読み込み(v0.4.1、Q-9)
+    # ログ・ops には件数と理由コードだけを書く。書き出し先・読み込み元のパスも書かない(INV-1)。
+    def export_snippets(self, path: str | Path) -> TransferResult:
+        """定型文だけを path に平文の JSON で書き出す(履歴は書き出さない)。確認の窓は画面が先に出す。"""
+        if self.store is None:
+            return TransferResult(False, error=self.store_error or "DB が開かれていません")
+        snips = [transfer.Snippet(i.name or "", i.text) for i in self.store.snippets()]
+        if not snips:
+            return TransferResult(False, error="書き出す定型文がありません。")
+        data = transfer.build_export(snips, self._now())
+        try:
+            transfer.write_file(Path(path), data)
+        except transfer.TransferError as e:
+            self.ops.write("snippets_export", result="failed")
+            self.log.warning("snippets export failed reason=%s", e.code)
+            if e.code == transfer.ERR_CANNOT_REPLACE:
+                return TransferResult(False, error=e.text)
+            return TransferResult(False, error="ファイルに書き出せませんでした(書き込めない場所か、ほかのアプリが使っています)。")
+        self.ops.write("snippets_export", result="ok", count=len(snips))
+        self.log.info("snippets exported count=%d", len(snips))
+        return TransferResult(True, count=len(snips))
+
+    def import_snippets(self, path: str | Path) -> TransferResult:
+        """path の定型文を既存の定型文に足す。同じ名前・同じ本文のものは足さない。読めない・形が違うファイルは何も変えない。"""
+        if self.store is None:
+            return TransferResult(False, error=self.store_error or "DB が開かれていません")
+        try:
+            incoming = transfer.read_file(Path(path))
+        except transfer.TransferError as e:
+            self.ops.write("snippets_import", result=e.code)
+            self.log.warning("snippets import rejected reason=%s", e.code)
+            return TransferResult(False, error=e.text)
+        existing = [transfer.Snippet(i.name or "", i.text) for i in self.store.snippets()]
+        plan = transfer.plan_import(existing, incoming, transfer.MAX_SNIPPETS)
+        try:
+            self.store.add_snippets([(s.name, s.text) for s in plan.to_add])
+        except (CryptoError, StoreError) as e:
+            self.ops.write("snippets_import", result="failed")
+            self.log.error("snippets import failed: %s", type(e).__name__)
+            return TransferResult(False, error="定型文を保存できませんでした(DB または暗号化のエラー)。")
+        self.ops.write("snippets_import", result="ok", read=len(incoming), added=len(plan.to_add),
+                       duplicates=plan.duplicates, over_limit=plan.over_limit)
+        self.log.info("snippets imported read=%d added=%d duplicates=%d over_limit=%d", len(incoming), len(plan.to_add),
+                      plan.duplicates, plan.over_limit)
+        if plan.to_add:
+            self.notifier.changed.emit()
+        return TransferResult(True, count=len(plan.to_add), duplicates=plan.duplicates, over_limit=plan.over_limit,
+                              read=len(incoming))
 
     def clear_all_interactive(self, parent: QWidget | None) -> None:
         from deskkit.ui import widgets

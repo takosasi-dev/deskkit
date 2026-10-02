@@ -70,8 +70,9 @@ def hotkey_problem(text: str) -> str | None:
     return None
 
 
-def normalize(section: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    """型・範囲の合わない値を既定値に戻す(書式が壊れていると展開できないため)。(設定, 変えたか)。"""
+def normalize(section: dict[str, Any], today: datetime) -> tuple[dict[str, Any], bool]:
+    """型・範囲の合わない値を既定値に戻す(書式が壊れていると展開できないため)。(設定, 変えたか)。
+    today はファイル名の形を確かめる日付。モジュールの時計の値を渡す(本物の時計に頼らない。v0.4.1)。"""
     out = dict(section)
     changed = False
     for k, v in DEFAULTS.items():
@@ -89,7 +90,7 @@ def normalize(section: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         ("line_format", compose.validate_line_format),
         ("new_file_header", compose.validate_header),
         ("separator", compose.validate_separator),
-        ("file_pattern", lambda p: compose.validate_pattern(p, datetime.now())),
+        ("file_pattern", lambda p: compose.validate_pattern(p, today)),
     ]
     for k, fn in checks:
         if fn(out[k]) is not None:
@@ -142,7 +143,7 @@ class JotDropModule:
         self.accent = info("jotdrop").accent
         section = dict(ctx.settings_dict())
         section.pop("enabled", None)
-        self.cfg, changed = normalize(section)
+        self.cfg, changed = normalize(section, clock())
         if changed:
             try:
                 ctx.write_settings(self.cfg)
@@ -281,7 +282,7 @@ class JotDropModule:
             self.ctx.write_settings(merged, restart=restart)
         except Exception as e:  # noqa: BLE001 - 設定ファイルが壊れているときなど
             return f"設定を保存できませんでした({type(e).__name__})"
-        self.cfg = normalize(merged)[0]
+        self.cfg = normalize(merged, self._clock())[0]
         self._confirm_armed = False
         self.notifier.changed.emit()
         return None

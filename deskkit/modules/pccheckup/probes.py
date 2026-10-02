@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -170,6 +171,7 @@ class Probes(Protocol):
     def storage_sense(self) -> bool: ...
     # 起動の安全(B)
     def secure_boot(self) -> SecureBootRaw: ...
+    def today(self) -> date: ...  # B2 の期限の判定に使う今日(モジュールの時計。v0.4.1)
 
 
 def _stopper(limit_s: float, cancel: Cancel) -> Callable[[], bool]:
@@ -464,6 +466,10 @@ class RealProbes:
     # ---- 起動の安全
     def secure_boot(self) -> SecureBootRaw:
         return self._cached("sb", read_secure_boot)  # type: ignore[no-any-return]
+
+    def today(self) -> date:
+        """モジュールから渡された時計(now)の今日。本物の date.today() は使わない(v0.4.1)。"""
+        return datetime.fromtimestamp(self._now()).date()
 
 
 def _denied(e: OSError) -> bool:

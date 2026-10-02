@@ -32,19 +32,46 @@ class ResultModel:
     member_of: dict[int, list[Group]] = field(default_factory=dict)
     level: str = "normal"
     exact_only: bool = False
+    # 利用者が選び直した「残す/ごみ箱へ」(写真ごと。v0.4.1)。メモリの中だけに持ち、ファイルには書かない。
+    # グループを作り直しても当て直す。新しいスキャンで捨てる(module.start_scan)。
+    choices: dict[int, bool] = field(default_factory=dict)
+    initial: dict[int, bool] = field(default_factory=dict)       # 初期の選び方(G-4・T-5)
 
     # ------------------------------------------------------------ 組み立て
     @classmethod
     def build(cls, photos: Iterable[Photo], exact_sets: Sequence[Sequence[Photo]], level: str, exact_only: bool,
-              cancel: threading.Event | None = None) -> ResultModel:
+              cancel: threading.Event | None = None, choices: dict[int, bool] | None = None) -> ResultModel:
         m = cls(photos={p.pid: p for p in photos}, exact_sets=[list(s) for s in exact_sets], level=level,
                 exact_only=exact_only)
         m._regroup(cancel)
+        if choices:
+            m.choices = {pid: bool(k) for pid, k in choices.items() if pid in m.photos}
+            m._apply_choices()
         return m
 
     def rebuild(self, level: str, exact_only: bool, cancel: threading.Event | None = None) -> ResultModel:
-        """FR-16: 特徴を調べ直さずにグループを作り直した新しいモデル(選択は初期状態に戻る)。"""
-        return ResultModel.build(self.photos.values(), self.exact_sets, level, exact_only, cancel)
+        """FR-16: 特徴を調べ直さずにグループを作り直した新しいモデル。利用者の選び直しは写真ごとに当て直す
+        (v0.4.1。T-9 を改めた)。当てると「残す」が無くなるグループは、そのグループだけ初期の選び方に戻す。"""
+        return ResultModel.build(self.photos.values(), self.exact_sets, level, exact_only, cancel, dict(self.choices))
+
+    def _apply_choices(self) -> None:
+        for pid, k in self.choices.items():
+            if pid in self.keep:
+                self.keep[pid] = k
+        # G-5・INV-2: 「残す」の無いグループは初期の選び方に戻す。戻すと「残す」→「ごみ箱へ」になる写真があり、
+        # それが別のグループの最後の「残す」だったら、そのグループも戻す。初期の状態ではどのグループにも「残す」が
+        # あり、戻した写真は二度と動かないので、この繰り返しは必ず終わる。
+        while True:
+            broken = [g for g in self.groups if not any(self.keep.get(p.pid, True) for p in g.photos)]
+            if not broken:
+                return
+            for g in broken:
+                for p in g.photos:
+                    self.keep[p.pid] = self.initial.get(p.pid, True)
+
+    def reset_choices(self) -> None:
+        """覚えている選び直しを捨てる(今の表示の選択はそのまま)。"""
+        self.choices = {}
 
     def _regroup(self, cancel: threading.Event | None) -> None:
         gid = 0
@@ -73,6 +100,7 @@ class ResultModel:
                 want = p.pid == g.recommended or p.pid in forced_keep
                 keep[p.pid] = keep.get(p.pid, False) or want
         self.keep = keep
+        self.initial = dict(keep)
         # FR-8: それぞれの見出しの中で「減らせる大きさ」の大きい順
         exact.sort(key=lambda g: (-self.reducible(g), g.gid))
         similar.sort(key=lambda g: (-self.reducible(g), g.gid))
@@ -117,6 +145,7 @@ class ResultModel:
         if not keep and self.keep[pid] and not self.can_trash(pid):
             return False
         self.keep[pid] = keep
+        self.choices[pid] = keep
         return True
 
     def invariant_ok(self) -> bool:
@@ -132,6 +161,8 @@ class ResultModel:
             self.photos.pop(pid, None)
             self.keep.pop(pid, None)
             self.member_of.pop(pid, None)
+            self.choices.pop(pid, None)
+            self.initial.pop(pid, None)
         self.exact_sets = [[p for p in s if p.pid not in gone] for s in self.exact_sets]
         kept: list[Group] = []
         for g in self.groups:

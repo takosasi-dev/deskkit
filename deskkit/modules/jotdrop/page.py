@@ -7,6 +7,7 @@ import functools
 import logging
 import re
 from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from PySide6.QtCore import Qt
@@ -69,6 +70,11 @@ def preview_text(data: bytes) -> str:
     return "\n".join(out)
 
 
+def pattern_hint(today: datetime) -> str:
+    """「ファイル名」の欄の説明。{date} を今日の日付で見せる(固定の日付にしない)。"""
+    return f"{{date}} が今日の日付({compose.expand('{date}', today, allowed=('date',))} の形)になります。.md か .txt。"
+
+
 class JotDropPage(W.ScrollPage):
     def __init__(self, module: JotDropModule) -> None:
         super().__init__()
@@ -124,6 +130,7 @@ class JotDropPage(W.ScrollPage):
         c.add(W.SettingRow("メモ欄を出すキー", "変えると JotDrop を起動し直して登録します。", self.key_edit))
         self.key_msg = W.label("", None, wrap=True)
         c.add(self.key_msg)
+        self.key_card = c
         self.add(c)
 
     def _line_edit(self, value: str, placeholder: str = "") -> QLineEdit:
@@ -148,7 +155,11 @@ class JotDropPage(W.ScrollPage):
         c.add(frow)
         self.pattern_edit = self._line_edit(str(self.m.cfg["file_pattern"]), "{date}.md")
         self.pattern_edit.editingFinished.connect(_guard(self._save_target))
-        c.add(W.SettingRow("ファイル名", "{date} が今日の日付(2026-09-26 の形)になります。.md か .txt。", self.pattern_edit))
+        hint = pattern_hint(self.m.now())
+        pattern_row = W.SettingRow("ファイル名", hint, self.pattern_edit)
+        # 説明の日付はモジュールの時計の今日(v0.4.1)。日付が変わったら _refresh_preview で書き直す
+        self.pattern_hint = next(lb for lb in pattern_row.findChildren(QLabel) if lb.text() == hint)
+        c.add(pattern_row)
         self.create_toggle = W.ToggleSwitch(bool(self.m.cfg["create_file"]), _acc())
         self.create_toggle.toggled.connect(_guard(lambda on: self._save({"create_file": bool(on)})))
         c.add(W.SettingRow("ファイルが無ければ作る", "日付が変わると新しいファイルになります。", self.create_toggle))
@@ -258,7 +269,14 @@ class JotDropPage(W.ScrollPage):
             self.key_pill.set_state("ok", f"{cfg['hotkey']} で書けます")
         else:
             self.key_pill.set_state("error", "キーが使えません")
-        self.banner.setVisible(not cfg["hotkey"] or not ok)
+        # v0.4.1: キーの欄は同時に 2 つ出さない。未設定なら先頭の呼びかけのカードだけ、設定済みなら「キー」のカードだけ
+        # (登録できなかったときも「キー」のカードに理由を出す)
+        has_key = bool(cfg["hotkey"])
+        self.banner.setVisible(not has_key)
+        self.key_card.setVisible(has_key)
+        for e in (self.banner_edit, self.key_edit):  # 切り替わった先の欄にも今のキーを出す
+            if not e.hasFocus() and e.text() != str(cfg["hotkey"]):
+                e.setText(str(cfg["hotkey"]))
         msg = err or ""
         for lb in (self.banner_msg, self.key_msg):
             lb.setText(msg)
@@ -271,6 +289,7 @@ class JotDropPage(W.ScrollPage):
 
     def _refresh_preview(self) -> None:
         now = self.m.now()
+        self.pattern_hint.setText(pattern_hint(now))
         path = self.m.target_path(now)
         self.pv_path.setText(f"今日の書き込み先: {path}")
         line = compose.expand(str(self.m.cfg["line_format"]), now, SAMPLE_TEXT)

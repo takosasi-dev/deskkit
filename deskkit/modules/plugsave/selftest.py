@@ -143,6 +143,25 @@ def run() -> int:
                "変わったファイルの古い版が _以前の版 に移る", fails)
         _check((dest / SECRET_FILE).read_bytes() == b"second version!", "新しい版が最終の場所にある", fails)
         _check(_hashes(src.parent) == before, "コピー元が変わっていない", fails)
+        # v0.4.1: 落ちた回(回の終わりの処理が走らない)のあとで、中身の欠けた小さいファイルを直す
+        (src / "c.txt").write_bytes(b"written in a run that stopped")
+        from deskkit.modules.plugsave.copier import BackupRun
+
+        finish = BackupRun._finish_markers
+        try:
+            BackupRun._finish_markers = lambda self: None  # type: ignore[method-assign]
+            m.start_backup(did, trigger="manual")
+        finally:
+            BackupRun._finish_markers = finish  # type: ignore[method-assign]
+        _check(sum(1 for p in work.iterdir() if p.is_dir()) == 1, "止まった回の印が残る", fails)
+        broken = dest / "c.txt"
+        st = broken.stat()
+        broken.write_bytes(b"\0" * st.st_size)
+        os.utime(broken, ns=(st.st_atime_ns, st.st_mtime_ns))
+        m.start_backup(did, trigger="manual")
+        _check(m.last is not None and m.last.prev_unfinished and m.last.recopied == 1
+               and broken.read_bytes() == b"written in a run that stopped" and not any(work.iterdir()),
+               "止まった回のあとで、欠けた小さいファイルを直して印を片づける", fails)
         # WM_DEVICECHANGE の構造体(E: と F:)
         vol = device.DEV_BROADCAST_VOLUME()
         vol.dbcv_size = ctypes.sizeof(vol)
